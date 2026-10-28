@@ -1,27 +1,54 @@
 // dsh-message-recall 客户端半。
 //
-// 两部分能力：
+// 职责边界（刻意做到最小、最安全）：
+//   - 只在用户消息框的复制按钮旁插一个撤回按钮（原生 DOM，不覆盖官方槽位）；
+//   - 点击后调用宿主 /dsh-message-recall/recall，由宿主真删除（表面替换 + 派生缓存失效）；
+//   - 宿主成功后，让当前会话重新加载窗口，界面自然少掉那几条（不再用 CSS 假装隐藏）。
 //
-// A. 撤回按钮 —— 覆盖用户消息节点（keyed slot "user"，priority -1 优先于官方），
-//    气泡正文仍走官方 Factory `conversation.chat.user.content`（样式不变），
-//    在正文下方自绘一条操作条，复制按钮之后就是撤回按钮。
-//
-// B. 真撤回 —— 官方 ConversationNodeAssembler 在重建窗口时不会剔除被
-//    `surfaceOp: replace` 遮蔽的旧事件，导致气泡只是"看不见"而仍在场。
-//    这里给装配器打补丁，在 replaceWindow / append 入口按撤回区间过滤，
-//    使被撤回的事件真正退出会话视图（与 Host 侧 deriveMessages 截断同语义）。
+// 不碰装配器、不覆盖官方 React 树、不改其它插件，任何异常都只影响按钮自身。
 window.__ModuleLoader__.load({
   id: "dsh-message-recall",
-  factory: (require) => {
-    const React = require("react");
-    const h = React.createElement;
-
+  factory: () => {
     const NAME = "dsh-message-recall";
     const ROUTE = "/dsh-message-recall";
-    const NS = "message-recall";
 
     /* ================================================================ */
-    /* 传输：同源 fetch（与宿主 webServer 注册的普通路由对应）            */
+    /* 文案                                                             */
+    /* ================================================================ */
+
+    const TEXT = {
+      zh: {
+        recall: "撤回",
+        only: "仅撤回这条消息",
+        from: "撤回这条及之后的所有消息",
+        fromWarn: "撤回这条及之后的所有消息（不可恢复）",
+        busy: "撤回中…",
+        failed: "撤回失败",
+        scope: "选择撤回范围",
+      },
+      en: {
+        recall: "Recall",
+        only: "Recall only this message",
+        from: "Recall this and all later messages",
+        fromWarn: "Recall this and all later messages (cannot be undone)",
+        busy: "Recalling…",
+        failed: "Recall failed",
+        scope: "Choose recall scope",
+      },
+    };
+
+    function dict() {
+      try {
+        return String(document.documentElement?.lang ?? "zh").toLowerCase().startsWith("en")
+          ? TEXT.en
+          : TEXT.zh;
+      } catch {
+        return TEXT.zh;
+      }
+    }
+
+    /* ================================================================ */
+    /* 传输                                                             */
     /* ================================================================ */
 
     function routeUrl(action, params) {
@@ -34,7 +61,7 @@ window.__ModuleLoader__.load({
       return url.toString();
     }
 
-    async function callApi(action, params, timeoutMs = 60000) {
+    async function callApi(action, params, timeoutMs = 90000) {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), timeoutMs);
       try {
@@ -47,19 +74,19 @@ window.__ModuleLoader__.load({
           signal: controller.signal,
         });
         const text = await response.text();
-        let data;
+        let data = null;
         try {
           data = text ? JSON.parse(text) : null;
         } catch {
-          throw new Error(`HTTP ${response.status}: ${text.slice(0, 120)}`);
+          throw new Error(`HTTP ${response.status}`);
         }
-        if (!data || typeof data !== "object") throw new Error(`HTTP ${response.status}: 空响应`);
+        if (!data || typeof data !== "object") throw new Error(`HTTP ${response.status}`);
         return data;
       } catch (error) {
-        if (error?.name === "AbortError") throw new Error("撤回请求超时");
+        if (error?.name === "AbortError") throw new Error("撤回超时");
         const message = String(error?.message ?? error);
         if (/failed to fetch|networkerror|load failed/i.test(message)) {
-          throw new Error("连不上撤回接口，确认 DSH 还在运行后刷新页面");
+          throw new Error("连不上撤回接口");
         }
         throw error;
       } finally {
@@ -68,570 +95,400 @@ window.__ModuleLoader__.load({
     }
 
     /* ================================================================ */
-    /* 撤回标记识别与窗口过滤                                            */
+    /* 会话重载：让界面按新表面重建                                     */
     /* ================================================================ */
-
-    /** 该事件是否是本插件写入的撤回标记。 */
-    function isRecallMarker(event) {
-      if (!event || event.type !== "user/message") return false;
-      const op = event.surfaceOp;
-      if (!op || typeof op !== "object" || op.op !== "replace") return false;
-      const id = event?.data?.id;
-      return typeof id === "string" && id.indexOf("recall-") === 0;
-    }
 
     /**
-     * 从窗口条目里剔除被撤回的事件。
+     * 让界面按新的表面重建。
      *
-     * 撤回标记覆盖 [startSeq, markerSeq]：区间内的事件连同标记本身
-     * 都不再参与会话视图装配。
+     * 客户端 uiConversation 的窗口装配自带剔除规则：
+     * 见到 `rewind-` 前缀的表面替换事件就剔除被遮蔽的节点。
+     * 所以这里只需让该会话重新装配一次窗口即可，不自己过滤、不打补丁。
      *
-     * @param entries - 装配器窗口条目。
-     * @returns 过滤后的条目（无撤回标记时原样返回）。
+     * @param sessionId - 目标会话。
+     * @param ctx - 插件上下文。
+     * @returns 是否触发了重建。
      */
-    function dropRecalled(entries) {
-      const list = Array.isArray(entries) ? entries : [...(entries ?? [])];
-      const hidden = new Set();
-      let marked = false;
+    async function reloadSession(sessionId, ctx) {
+      if (!sessionId) return false;
 
-      for (const entry of list) {
-        const event = entry?.event;
-        if (!isRecallMarker(event)) continue;
-        marked = true;
-        const start = Number(event.surfaceOp.startSeq);
-        const end = Number(event.seq);
-        if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
-        for (let seq = start; seq <= end; seq += 1) hidden.add(seq);
-        if (Array.isArray(event.sourceEventSeqs)) {
-          for (const source of event.sourceEventSeqs) {
-            if (typeof source === "number") hidden.add(source);
+      const conversation = (() => {
+        try { return ctx?.get?.("uiConversation", false); } catch { return undefined; }
+      })();
+
+      // 用装配器当前窗口重新装配一次：它内部会按 rewind- 标记剔除。
+      try {
+        const binding = conversation?.binding?.(sessionId);
+        const assembler = binding?.assembler;
+        if (assembler && typeof assembler.replaceWindow === "function") {
+          const inputs = assembler.inputs;
+          if (inputs instanceof Map && inputs.size > 0) {
+            assembler.replaceWindow([...inputs.values()], assembler.hasMore === true);
+            return true;
           }
         }
-      }
-
-      if (!marked) return list;
-      return list.filter((entry) => {
-        const seq = entry?.event?.seq;
-        return typeof seq === "number" && !hidden.has(seq);
-      });
-    }
-
-    /** 给一个装配器实例打上过滤补丁。 */
-    function patchAssembler(assembler) {
-      if (!assembler || assembler.__dshRecallPatched) return assembler;
-      assembler.__dshRecallPatched = true;
-
-      const replaceWindow = assembler.replaceWindow?.bind(assembler);
-      const append = assembler.append?.bind(assembler);
-
-      if (typeof replaceWindow === "function") {
-        assembler.replaceWindow = function recallReplaceWindow(entries, hasMore) {
-          return replaceWindow(dropRecalled(entries), hasMore);
-        };
-      }
-
-      if (typeof append === "function") {
-        assembler.append = function recallAppend(record) {
-          // 撤回标记到达：按当前窗口重建，被撤回的气泡立即消失。
-          if (isRecallMarker(record?.event) && typeof assembler.replaceWindow === "function") {
-            const current = assembler.inputs instanceof Map ? [...assembler.inputs.values()] : [];
-            return assembler.replaceWindow([...current, record], assembler.hasMore === true);
-          }
-          return append(record);
-        };
-      }
-
-      return assembler;
-    }
-
-    /* ================================================================ */
-    /* 视图                                                             */
-    /* ================================================================ */
-
-    const zh = {
-      recall: "撤回这条及之后的消息",
-      recallOnly: "仅撤回这条消息",
-      recallFrom: "撤回这条及之后的所有消息",
-      scopeTitle: "选择撤回范围",
-      busy: "撤回中…",
-      copy: "复制",
-      copied: "已复制",
-      failed: "撤回失败",
-    };
-    const en = {
-      recall: "Recall this and everything after",
-      recallOnly: "Recall only this message",
-      recallFrom: "Recall this and all later messages",
-      scopeTitle: "Choose recall scope",
-      busy: "Recalling…",
-      copy: "Copy",
-      copied: "Copied",
-      failed: "Recall failed",
-    };
-
-    const styles = {
-      row: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "flex-end",
-        gap: "4px",
-        minHeight: "20px",
-      },
-      iconButton: {
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        width: "20px",
-        height: "20px",
-        padding: "0",
-        border: "0",
-        borderRadius: "5px",
-        background: "transparent",
-        color: "inherit",
-        cursor: "pointer",
-        opacity: 0.55,
-        lineHeight: 1,
-        transition: "opacity 120ms ease",
-      },
-      time: {
-        fontSize: "11px",
-        opacity: 0.5,
-        marginRight: "2px",
-        whiteSpace: "nowrap",
-      },
-      notice: {
-        fontSize: "11px",
-        opacity: 0.8,
-        marginRight: "4px",
-      },
-      recallWrap: {
-        position: "relative",
-        display: "inline-flex",
-        alignItems: "center",
-      },
-      menu: {
-        position: "absolute",
-        bottom: "calc(100% + 6px)",
-        right: "0",
-        minWidth: "210px",
-        padding: "4px",
-        borderRadius: "8px",
-        border: "1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.24))",
-        background: "var(--dsw-alias-bg-elevated, #1f1f1f)",
-        boxShadow: "0 6px 20px rgba(0,0,0,0.28)",
-        zIndex: 40,
-        display: "flex",
-        flexDirection: "column",
-        gap: "2px",
-      },
-      menuItem: {
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "flex-start",
-        gap: "1px",
-        width: "100%",
-        padding: "7px 9px",
-        border: "0",
-        borderRadius: "6px",
-        background: "transparent",
-        color: "inherit",
-        cursor: "pointer",
-        textAlign: "left",
-        fontSize: "12px",
-        lineHeight: 1.35,
-      },
-      menuLabel: { fontSize: "12px" },
-      menuHint: { fontSize: "11px", opacity: 0.6 },
-    };
-
-    function CopyGlyph({ copied }) {
-      return copied
-        ? h("svg", { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", "aria-hidden": "true" },
-            h("path", { d: "M3.5 8.5 6.5 11.5 12.5 5", stroke: "currentColor", strokeWidth: 1.4, strokeLinecap: "round", strokeLinejoin: "round" }))
-        : h("svg", { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", "aria-hidden": "true" },
-            h("rect", { x: 5.5, y: 5.5, width: 8, height: 8, rx: 2, stroke: "currentColor", strokeWidth: 1.2 }),
-            h("path", { d: "M10.5 5.5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v4.5a2 2 0 0 0 2 2h1.5", stroke: "currentColor", strokeWidth: 1.2, strokeLinecap: "round" }));
-    }
-
-    function RecallGlyph() {
-      return h("svg", { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", "aria-hidden": "true" },
-        h("path", {
-          d: "M6.2 3.4 2.2 6.9l4 3.5V8.1h2.9c2.2 0 3.7 1.1 4.7 2.9-.3-3.1-2.2-5.3-4.7-5.3H6.2V3.4Z",
-          stroke: "currentColor",
-          strokeWidth: 1.2,
-          strokeLinejoin: "round",
-          strokeLinecap: "round",
-        }));
-    }
-
-    /** 把 text 写进剪贴板。 */
-    function writeClipboard(text) {
-      if (navigator.clipboard?.writeText) {
-        return navigator.clipboard.writeText(text).then(() => true, () => false);
-      }
-      try {
-        const area = document.createElement("textarea");
-        area.value = text;
-        area.style.position = "fixed";
-        area.style.opacity = "0";
-        document.body.appendChild(area);
-        area.select();
-        const ok = document.execCommand("copy");
-        area.remove();
-        return Promise.resolve(ok);
       } catch {
-        return Promise.resolve(false);
+        /* 继续兜底 */
       }
-    }
 
-    /** 从内容块拼出纯文本。 */
-    function textOf(content) {
-      if (typeof content === "string") return content;
-      if (!Array.isArray(content)) return "";
-      return content.map((block) => (typeof block?.text === "string" ? block.text : "")).join("");
-    }
-
-    /** 把消息内容整理成官方 Factory 需要的形状。 */
-    function prepareContent(data) {
-      const texts = [];
-      const attachments = [];
-      const extraBlocks = [];
-      for (const block of Array.isArray(data?.content) ? data.content : []) {
-        if (!block) continue;
-        if (block.type === "text" && typeof block.text === "string") texts.push(block.text);
-        else if (block.type === "image" && block.attachment !== undefined) {
-          attachments.push({ type: "image", image: { attachment: block.attachment } });
-        } else if (block.type === "file" && block.attachment !== undefined) {
-          attachments.push({ type: "file", file: block.attachment });
-        } else extraBlocks.push(block);
-      }
-      return {
-        text: texts.join(""),
-        attachments,
-        extraBlocks,
-        referenceLabels: Array.isArray(data?.referenceLabels) ? data.referenceLabels : [],
-      };
-    }
-
-    /** 本地时间 HH:MM。 */
-    function clockOf(time) {
-      if (typeof time !== "number") return "";
+      // 兜底：重新打开会话（官方 openSession = replaceMain(..., "reveal")）。
       try {
-        return new Date(time).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+        const workspace = ctx?.get?.("uiWorkspace", false);
+        if (workspace && typeof workspace.openSession === "function") {
+          workspace.openSession(sessionId);
+          return true;
+        }
+      } catch {
+        /* 忽略 */
+      }
+      return false;
+    }
+
+    /* ================================================================ */
+    /* 当前会话                                                         */
+    /* ================================================================ */
+
+    /**
+     * 取当前会话 id。
+     *
+     * 必须带上它：否则宿主只能跨会话按文本猜目标，
+     * 会命中别的会话里同文本的消息（表现为「该消息已被撤回」但气泡还在）。
+     *
+     * @param ctx - 插件上下文。
+     * @returns 会话 id，取不到返回空串。
+     */
+    function currentSessionId(ctx) {
+      try {
+        const workspace = ctx?.get?.("uiWorkspace", false);
+        const selected = workspace?.selection?.getSnapshot?.()?.sessionId;
+        if (typeof selected === "string" && selected) return selected;
+      } catch {
+        /* 继续兜底 */
+      }
+      try {
+        const sessions = ctx?.get?.("sessions", false);
+        const list = sessions?.list?.() ?? [];
+        // 兜底：取事件最多的活会话。
+        let best = "";
+        let bestCount = -1;
+        for (const row of list) {
+          const id = row?.id ?? row?.header?.id;
+          if (typeof id !== "string" || !id) continue;
+          let count = 0;
+          try {
+            count = Number(row?.snapshotEvents?.()?.length ?? 0);
+          } catch {
+            count = 0;
+          }
+          if (count >= bestCount) {
+            bestCount = count;
+            best = id;
+          }
+        }
+        return best;
       } catch {
         return "";
       }
+    }
+
+    /* ================================================================ */
+    /* 按钮（原生 DOM）                                                  */
+    /* ================================================================ */
+
+    const MOUNT = "data-dsh-recall-mount";
+
+    /* ================================================================ */
+    /* 兼容：收起 dsh-purge 的「回退」按钮（缺失时零影响）               */
+    /* ================================================================ */
+
+    const PURGE_STYLE_ID = "dsh-message-recall-purge-compat";
+    const PURGE_SELECTOR = ".dshp-rewind-wrap";
+
+    /**
+     * 把输入框里的「回退」按钮藏起来，仅当它真的存在时。
+     *
+     * 兼容性约定：
+     *   - purge 未安装 / 改名 / 卸载 => 查不到该元素，直接返回，
+     *     不注入样式、不报错；
+     *   - 样式用独立 id，卸载时整块移除，不残留；
+     *   - 纯 CSS 隐藏，不引用 purge 的任何对象，也不改它的文件。
+     */
+    function syncPurgeComfort() {
+      try {
+        const present = document.querySelector(PURGE_SELECTOR) !== null;
+        const existing = document.getElementById(PURGE_STYLE_ID);
+        if (present && !existing) {
+          const style = document.createElement("style");
+          style.id = PURGE_STYLE_ID;
+          // 它的职责已由本插件的按消息撤回取代，避免两个入口并存。
+          style.textContent = `${PURGE_SELECTOR}{display:none !important}`;
+          document.head.appendChild(style);
+          return;
+        }
+        if (!present && existing) existing.remove();
+      } catch {
+        /* 任何异常都不影响本插件主流程 */
+      }
+    }
+
+    function iconSvg() {
+      return '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false">'
+        + '<path d="M6.2 3.4 2.2 6.9l4 3.5V8.1h2.9c2.2 0 3.7 1.1 4.7 2.9-.3-3.1-2.2-5.3-4.7-5.3H6.2V3.4Z"'
+        + ' stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+    }
+
+    /**
+     * 从用户消息行里取出气泡正文纯文本。
+     *
+     * 不能直接用 row.textContent：会把时间戳和按钮文案一起带进来。
+     *
+     * @param row - 用户消息行。
+     * @param bar - 操作条（其内容不计入正文）。
+     * @returns 正文纯文本。
+     */
+    function bubbleTextOf(row, bar) {
+      const parts = [];
+      const walk = (node) => {
+        if (!node) return;
+        if (bar && (node === bar || bar.contains(node))) return;
+        if (node.nodeType === 3) {
+          const value = String(node.nodeValue ?? "");
+          if (value.trim()) parts.push(value);
+          return;
+        }
+        if (node.nodeType !== 1) return;
+        const tag = node.tagName;
+        if (tag === "BUTTON" || tag === "SVG" || tag === "SCRIPT" || tag === "STYLE") return;
+        for (const child of node.childNodes ?? []) walk(child);
+      };
+      walk(row);
+      return parts.join(" ").replace(/\s+/g, " ").trim();
+    }
+
+    /** 找到用户消息行的操作条（复制按钮所在那一行）。 */
+    function findActionRow(row) {
+      for (const button of row.querySelectorAll("button")) {
+        const label = (button.getAttribute("aria-label") ?? button.getAttribute("title") ?? "").trim();
+        if (/复制|copy/i.test(label)) return button.parentElement;
+      }
+      let best = null;
+      for (const node of row.querySelectorAll("div")) {
+        if (node.querySelector("button")) best = node;
+      }
+      return best;
+    }
+
+    /**
+     * 从消息行的 DOM 上取官方消息 id。
+     *
+     * 节点 key 由 `match()` 返回的 id 构成，形如
+     * `["node","input-message<id>",null]`，这里把 id 抽出来。
+     * 用 id 定位是精确的：不会像文本那样命中别的会话或同文本消息。
+     *
+     * @param row - 消息行元素。
+     * @returns 消息 id，取不到返回空串。
+     */
+    function messageIdOf(row) {
+      const node = row.closest("[data-chat-node-key]") ?? row.querySelector("[data-chat-node-key]");
+      const raw = node?.getAttribute("data-chat-node-key") ?? "";
+      if (!raw) return "";
+      // key 可能是 JSON 数组，也可能就是裸 id。
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          for (const part of parsed) {
+            if (typeof part !== "string") continue;
+            const match = part.match(/^input-message(.+)$/);
+            if (match) return match[1];
+          }
+          return "";
+        }
+      } catch {
+        /* 不是 JSON，按裸值处理 */
+      }
+      const match = raw.match(/^input-message(.+)$/);
+      return match ? match[1] : "";
+    }
+
+    /**
+     * 造一个撤回按钮。
+     *
+     * @param target - `{ messageId, text }`，优先用 messageId 精确定位。
+     * @param ctx - 插件上下文。
+     * @param onRecalled - 撤回成功回调。
+     * @returns 按钮宿主元素。
+     */
+    function buildButton(target, ctx, onRecalled) {
+      const labels = dict();
+
+      const host = document.createElement("span");
+      host.setAttribute(MOUNT, "");
+      host.style.cssText = "position:relative;display:inline-flex;align-items:center;";
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("data-dsh-recall-button", "");
+      button.title = labels.recall;
+      button.setAttribute("aria-label", labels.recall);
+      button.style.cssText = "display:inline-flex;align-items:center;justify-content:center;"
+        + "width:20px;height:20px;padding:0;border:0;border-radius:5px;background:transparent;"
+        + "color:inherit;opacity:.7;cursor:pointer;line-height:1;";
+      button.innerHTML = iconSvg();
+      button.addEventListener("mouseenter", () => { button.style.opacity = "1"; });
+      button.addEventListener("mouseleave", () => { button.style.opacity = "0.7"; });
+
+      const menu = document.createElement("div");
+      menu.setAttribute("role", "menu");
+      menu.style.cssText = "position:absolute;bottom:calc(100% + 6px);right:0;min-width:200px;"
+        + "padding:4px;border-radius:8px;border:1px solid rgba(127,127,127,.24);"
+        + "background:var(--dsw-alias-bg-elevated,#1f1f1f);box-shadow:0 6px 20px rgba(0,0,0,.3);"
+        + "z-index:50;display:none;";
+
+      const notice = document.createElement("span");
+      notice.style.cssText = "font-size:11px;margin-left:4px;opacity:.75;";
+
+      const item = (scope, label) => {
+        const el = document.createElement("button");
+        el.type = "button";
+        el.setAttribute("role", "menuitem");
+        el.setAttribute("data-dsh-recall-scope", scope);
+        el.textContent = label;
+        el.style.cssText = "display:block;width:100%;padding:7px 10px;border:0;border-radius:6px;"
+          + "background:transparent;color:inherit;text-align:left;font-size:12px;cursor:pointer;"
+          + "white-space:nowrap;";
+        el.addEventListener("mouseenter", () => { el.style.background = "rgba(127,127,127,.16)"; });
+        el.addEventListener("mouseleave", () => { el.style.background = "transparent"; });
+        el.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void run(scope);
+        });
+        return el;
+      };
+
+      // 「仅撤回本条」放第一位：破坏面最小，是最常用也最安全的操作。
+      menu.appendChild(item("only", labels.only));
+      menu.appendChild(item("from", labels.fromWarn));
+
+      let busy = false;
+
+      const run = async (scope) => {
+        if (busy) return;
+        busy = true;
+        menu.style.display = "none";
+        button.disabled = true;
+        button.style.opacity = "0.45";
+        button.title = labels.busy;
+        notice.textContent = "";
+        try {
+          const sessionId = currentSessionId(ctx);
+          if (!sessionId) throw new Error("取不到当前会话");
+          // 优先用 messageId 精确撤回；只有拿不到 id 时才退回按文本。
+          const payload = { sessionId, scope };
+          if (target.messageId) payload.messageId = target.messageId;
+          else payload.text = target.text;
+          const result = await callApi("recall", payload);
+          if (!result?.ok) throw new Error(result?.message ?? labels.failed);
+          await onRecalled?.(result);
+        } catch (error) {
+          notice.textContent = String(error?.message ?? error);
+        } finally {
+          // 无论成功失败都必须复位，否则按钮永远停在「撤回中…」。
+          busy = false;
+          button.disabled = false;
+          button.style.opacity = "0.7";
+          button.title = labels.recall;
+        }
+      };
+
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (busy) return;
+        menu.style.display = menu.style.display === "none" ? "block" : "none";
+      });
+
+      const onDoc = (event) => {
+        if (host.contains(event.target)) return;
+        menu.style.display = "none";
+      };
+      document.addEventListener("mousedown", onDoc, true);
+
+      host.appendChild(button);
+      host.appendChild(menu);
+      host.appendChild(notice);
+      return host;
+    }
+
+    /* ================================================================ */
+    /* 扫描挂载                                                         */
+    /* ================================================================ */
+
+    function sweep(ctx) {
+      let added = 0;
+      for (const row of document.querySelectorAll("[data-chat-flow-kind='user']")) {
+        if (!(row instanceof HTMLElement)) continue;
+        if (row.querySelector(`[${MOUNT}]`)) continue;
+
+        const bar = findActionRow(row);
+        if (!bar) continue;
+
+        const text = bubbleTextOf(row, bar);
+        const messageId = messageIdOf(row);
+        if (!text && !messageId) continue;
+
+        bar.appendChild(buildButton({ messageId, text }, ctx, async (result) => {
+          // 宿主已经真删除了；这里让会话窗口按新表面重建。
+          await reloadSession(result.sessionId, ctx);
+        }));
+        added += 1;
+      }
+      return added;
     }
 
     /* ================================================================ */
     /* 插件                                                             */
     /* ================================================================ */
 
-    /**
-     * 错误边界：节点渲染一旦抛错就退回官方外观，绝不让整个客户端崩溃。
-     */
-    class RecallBoundary extends React.Component {
-      constructor(props) {
-        super(props);
-        this.state = { failed: false };
-      }
-
-      static getDerivedStateFromError() {
-        return { failed: true };
-      }
-
-      componentDidCatch(error) {
-        try {
-          console.warn("[dsh-message-recall] node render failed:", error);
-        } catch {
-          /* ignore */
-        }
-      }
-
-      render() {
-        if (this.state.failed) return this.props.fallback ?? null;
-        return this.props.children ?? null;
-      }
-    }
-
     function apply(ctx) {
-      // 官方 locale 只提供 register / bind；这里用 bind 得到命名空间的 t()。
-      const bound = typeof ctx.locale?.bind === "function" ? ctx.locale.bind(NS) : null;
-      const t = (key) => {
-        try {
-          if (typeof bound === "function") {
-            const value = bound(key);
-            if (typeof value === "string" && value !== key) return value;
-          }
-        } catch {
-          /* 回退到内置字典 */
-        }
-        return zh[key] ?? key;
-      };
+      ctx.effect(() => {
+        try { ctx.locale?.register?.("message-recall", TEXT); } catch { /* 忽略 */ }
+        return () => {};
+      }, "dsh-message-recall: dictionaries");
 
-      ctx.effect(() => ctx.locale?.register?.(NS, { zh, en }), "dsh-message-recall: dictionaries");
+      let observer = null;
+      let timer = null;
 
-      /** 当前会话 id：优先官方 UI Workspace 的持久化选择，其次从 DOM 兜底。 */
-      function currentSessionId() {
-        try {
-          const workspace = ctx.get("uiWorkspace", false);
-          const selected = workspace?.selection?.getSnapshot?.()?.sessionId;
-          if (typeof selected === "string" && selected) return selected;
-        } catch {
-          /* 继续兜底 */
-        }
-        // DOM 兜底：会话根节点通常带 data-session-id。
-        const marker = document.querySelector("[data-session-id]");
-        const fromDom = marker?.getAttribute("data-session-id");
-        if (fromDom) return fromDom;
-        return "";
-      }
+      ctx.effect(() => {
+        const schedule = () => {
+          if (timer !== null) return;
+          timer = window.setTimeout(() => {
+            timer = null;
+            try { sweep(ctx); } catch { /* 单次失败不影响界面 */ }
+            syncPurgeComfort();
+          }, 150);
+        };
 
-      /** 执行撤回：Host 截断表面，再把原文回填输入框。 */
-      async function recall(sessionId, seq, fallbackText, setDraft, scope) {
-        const result = await callApi("recall", { sessionId, seq, scope });
-        if (!result || result.ok !== true) throw new Error(result?.message ?? t("failed"));
-        const text = typeof result.text === "string" && result.text !== "" ? result.text : (fallbackText ?? "");
-        if (text && typeof setDraft === "function") setDraft(text);
-        return result;
-      }
+        observer = new MutationObserver(schedule);
+        observer.observe(document.body, { childList: true, subtree: true });
+        schedule();
 
-      /* ---------- 用户消息节点（气泡 + 操作条） ---------- */
-
-      function UserRecallNodeView(props) {
-        const { node, renderFactorySlot, loadImage, t: translate, inputActions, sessionId: injectedSessionId } = props;
-        const data = node?.data ?? {};
-        const content = React.useMemo(() => prepareContent(data), [data]);
-        const plain = content.text;
-        // uiSession.provide 把 inputActions 作为 Session 作用域标准 prop 下发。
-        const setDraft = typeof inputActions?.setDraft === "function"
-          ? (text) => inputActions.setDraft(text)
-          : undefined;
-
-        const [copied, setCopied] = React.useState(false);
-        const [phase, setPhase] = React.useState("idle");
-        const [error, setError] = React.useState(null);
-        const [menuOpen, setMenuOpen] = React.useState(false);
-
-        const copy = React.useCallback(
-          (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            writeClipboard(plain).then((ok) => {
-              if (!ok) return;
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 1200);
-            });
-          },
-          [plain],
-        );
-
-        /** 执行一次撤回，scope 为 only / from。 */
-        const run = React.useCallback(
-          async (event, scope) => {
-            event?.preventDefault?.();
-            event?.stopPropagation?.();
-            setMenuOpen(false);
-            if (phase === "busy") return;
-            const sessionId = injectedSessionId || currentSessionId();
-            if (!sessionId) {
-              setError("取不到会话 id");
-              return;
-            }
-            setPhase("busy");
-            setError(null);
-            try {
-              const result = await recall(sessionId, Number(data.seq), plain, setDraft, scope);
-              setPhase("done");
-              if (result?.recalledCount > 1) setError(`已撤回 ${result.recalledCount} 条`);
-            } catch (cause) {
-              setPhase("idle");
-              setError(String(cause?.message ?? cause));
-            }
-          },
-          [data.seq, injectedSessionId, phase, plain, setDraft, t],
-        );
-
-        // 点外部收起菜单。
-        React.useEffect(() => {
-          if (!menuOpen) return undefined;
-          const close = () => setMenuOpen(false);
-          window.addEventListener("click", close, true);
-          window.addEventListener("keydown", close, true);
-          return () => {
-            window.removeEventListener("click", close, true);
-            window.removeEventListener("keydown", close, true);
-          };
-        }, [menuOpen]);
-
-        const clock = clockOf(data.time);
-        const copyLabel = copied ? (translate?.("copied") ?? t("copied")) : (translate?.("copy") ?? t("copy"));
-        const recallLabel = phase === "busy" ? t("busy") : t("recall");
-
-        /** 撤回范围菜单项。 */
-        const menuItem = (scope, label, hint) =>
-          h(
-            "button",
-            {
-              type: "button",
-              role: "menuitem",
-              "data-dsh-recall-scope": scope,
-              onClick: (event) => run(event, scope),
-              style: styles.menuItem,
-              onMouseEnter: (e) => { e.currentTarget.style.background = "var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,0.16))"; },
-              onMouseLeave: (e) => { e.currentTarget.style.background = "transparent"; },
-            },
-            h("span", { style: styles.menuLabel }, label),
-            hint ? h("span", { style: styles.menuHint }, hint) : null,
-          );
-
-        return h(
-          "div",
-          { style: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "6px" } },
-          renderFactorySlot("conversation.chat.user.content", {
-            content,
-            loadImage,
-            facts: {},
-            interactive: true,
-          }),
-          h(
-            "div",
-            { style: styles.row, "data-dsh-recall-row": "" },
-            error !== null ? h("span", { style: styles.notice, role: "status" }, error) : null,
-            clock ? h("span", { style: styles.time }, clock) : null,
-            phase === "done"
-              ? null
-              : h(
-                  "span",
-                  { style: styles.recallWrap },
-                  h(
-                    "button",
-                    {
-                      type: "button",
-                      title: recallLabel,
-                      "aria-label": recallLabel,
-                      "aria-haspopup": "menu",
-                      "aria-expanded": menuOpen ? "true" : "false",
-                      "data-dsh-recall-button": "",
-                      disabled: phase === "busy",
-                      onClick: (event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        if (phase === "busy") return;
-                        setMenuOpen((open) => !open);
-                      },
-                      style: styles.iconButton,
-                      onMouseEnter: (e) => { e.currentTarget.style.opacity = "1"; },
-                      onMouseLeave: (e) => { e.currentTarget.style.opacity = "0.55"; },
-                    },
-                    h(RecallGlyph, {}),
-                  ),
-                  menuOpen
-                    ? h(
-                        "div",
-                        { role: "menu", "aria-label": t("scopeTitle"), style: styles.menu },
-                        menuItem("only", t("recallOnly"), ""),
-                        menuItem("from", t("recallFrom"), ""),
-                      )
-                    : null,
-                ),
-            h(
-              "button",
-              {
-                type: "button",
-                title: copyLabel,
-                "aria-label": copyLabel,
-                onClick: copy,
-                style: styles.iconButton,
-                onMouseEnter: (e) => { e.currentTarget.style.opacity = "1"; },
-                onMouseLeave: (e) => { e.currentTarget.style.opacity = "0.55"; },
-              },
-              h(CopyGlyph, { copied }),
-            ),
-          ),
-        );
-      }
-
-      /* ---------- 注册 ---------- */
-
-      /**
-       * 兜底渲染：与官方外观一致的用户气泡（无撤回按钮）。
-       * 只在撤回组件抛错时使用，保证消息始终可见。
-       */
-      function UserRecallPlain(props) {
-        const { node, renderFactorySlot, loadImage } = props;
-        const data = node?.data ?? {};
-        let content;
-        try {
-          content = prepareContent(data);
-        } catch {
-          content = { text: "", attachments: [], extraBlocks: [], referenceLabels: [] };
-        }
-        return renderFactorySlot("conversation.chat.user.content", {
-          content,
-          loadImage,
-          facts: {},
-          interactive: true,
-        });
-      }
-
-      ctx.slots.inject("conversation.chat.node", () => ctx.slots.register(
-        {
-          name: "conversation.chat.node",
-          key: "user",
-          // 比官方条目（默认 0）更低的 priority 优先渲染。
-          priority: -1,
-          locale: NS,
-          // 槽位注入：官方把当前会话 id 直接下发给 Session 作用域的条目。
-          inject: (sessionId) => ({ sessionId }),
-        },
-        function UserRecallNodeBoundary(props) {
-          return h(
-            RecallBoundary,
-            {
-              fallback: h(UserRecallPlain, props),
-            },
-            h(UserRecallNodeView, props),
-          );
-        },
-      ));
-
-      /* ---------- 装配器补丁：让被撤回的事件真正消失 ---------- */
-
-      ctx.inject(["uiConversation"], (scope) => {
-        scope.effect(() => {
-          const conversation = scope.uiConversation;
-          if (!conversation || typeof conversation.binding !== "function") return;
-
-          const original = conversation.binding.bind(conversation);
-          conversation.binding = function bindingWithRecall(source) {
-            const binding = original(source);
-            if (binding?.assembler) patchAssembler(binding.assembler);
-            return binding;
-          };
-
-          // 已建立的绑定也补一次。
-          try {
-            for (const record of conversation.bindings?.values?.() ?? []) {
-              if (record?.binding?.assembler) patchAssembler(record.binding.assembler);
-            }
-          } catch {
-            /* 忽略 */
-          }
-
-          return () => {
-            conversation.binding = original;
-          };
-        }, "dsh-message-recall: assembler filter");
-      });
+        return () => {
+          try { observer?.disconnect(); } catch { /* 忽略 */ }
+          observer = null;
+          if (timer !== null) window.clearTimeout(timer);
+          for (const node of document.querySelectorAll(`[${MOUNT}]`)) node.remove();
+          // 卸载时把兼容样式摘掉，不给其它插件留副作用。
+          try { document.getElementById(PURGE_STYLE_ID)?.remove(); } catch { /* 忽略 */ }
+        };
+      }, "dsh-message-recall: mount");
     }
 
     return {
       name: NAME,
       inject: ["slots", "locale"],
       apply,
-      /** 内部纯函数出口，供离线测试验证窗口过滤语义。 */
-      __test: { dropRecalled, isRecallMarker, patchAssembler },
+      __test: { dict, bubbleTextOf },
     };
   },
 });

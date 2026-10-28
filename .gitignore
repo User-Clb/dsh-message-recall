@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+
+# 本地验证脚本的临时输出
+*.txt

@@ -1,19 +1,21 @@
 /**
- * 宿主半端到端验证：用假 ctx + 真会话对象模拟一次完整撤回，
- * 确认 append 被调用、区间正确、原文回传、模型派生被过滤。
+ * 宿主侧撤回测试。
  *
- * 运行：node test/host-recall.test.mjs
+ * 关键点：stub 必须提供官方 `session.surface.nodes`，
+ * 因为实现依赖它做区间计算与结果复核。
+ *
+ * 运行：node --test test/host-recall.test.mjs
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { registerRecall } from '../src/recall.js';
 
-/** 造一个最小可用的假 Session（只有插件会用到的成员）。 */
+/** 造一个带官方 surface 语义的最小会话。 */
 function makeSession(events) {
   const log = [...events];
   const appended = [];
-  // 与真实 Session 一致：surface.nodes 会随 append 的 surfaceOp 折叠。
-  const nodes = events.map((event) => event.seq);
+  const nodes = events.filter((event) => event.surfaceOp === 'append').map((event) => event.seq);
+
   return {
     appended,
     snapshotEvents: () => log,
@@ -26,7 +28,7 @@ function makeSession(events) {
       const event = { type, seq: log.length, time: Date.now(), data, ...opts };
       log.push(event);
       appended.push(event);
-      // 折叠表面。
+
       const op = opts?.surfaceOp;
       if (op === undefined || op === 'append') {
         nodes.push(event.seq);
@@ -39,7 +41,14 @@ function makeSession(events) {
       return event;
     },
     deriveMessages() {
-      return log.filter((event) => event.type === 'user/message' || event.type === 'assistant/message');
+      const onSurface = new Set(nodes);
+      return log.filter((event) => onSurface.has(event.seq))
+        .filter((event) => event.type === 'user/message' || event.type === 'assistant/message')
+        .map((event) => ({
+          id: event.data?.id ?? event.data?.message?.id,
+          role: event.type === 'user/message' ? 'user' : 'assistant',
+          content: event.data?.content ?? event.data?.message?.content ?? [],
+        }));
     },
   };
 }
@@ -60,20 +69,18 @@ const assistantEvent = (seq, id, text) => ({
   data: { message: { id, role: 'assistant', content: [{ type: 'text', text }] } },
 });
 
-/** 构造假 ctx：sessions / agents / sessionController 都从同一张表取。 */
 function makeCtx(session, sessionId) {
-  const removed = [];
+  // 官方会话对象带 id，按文本定位依赖它。
+  if (session && !session.id) session.id = sessionId;
   const services = {
-    sessions: { get: (id) => (id === sessionId ? session : undefined) },
-    agents: { get: () => ({ phase: { kind: 'idle' }, inbox: { nextTurn: [], nextStep: [] } }) },
-    sessionController: {
-      updateQueue: async (request) => {
-        removed.push(request);
-      },
+    sessions: {
+      get: (id) => (id === sessionId ? session : undefined),
+      list: () => (session ? [session] : []),
     },
+    agents: { get: () => ({ phase: { kind: 'idle' }, inbox: { nextTurn: [], nextStep: [] } }) },
+    sessionController: { updateQueue: async () => {} },
   };
   return {
-    removed,
     get(name) {
       if (name in services) return services[name];
       throw new Error(`unknown service ${name}`);
@@ -81,7 +88,7 @@ function makeCtx(session, sessionId) {
   };
 }
 
-test('撤回一条用户消息：区间正确、原文回传、标记被派生过滤', async () => {
+test('撤回一条：区间正确、表面真的变了、原文回传', async () => {
   const sessionId = 'session-test';
   const session = makeSession([
     userEvent(0, 'u1', '第一条'),
@@ -91,81 +98,31 @@ test('撤回一条用户消息：区间正确、原文回传、标记被派生�
   ]);
   const ctx = makeCtx(session, sessionId);
 
-  const result = await registerRecall.recall(ctx, { sessionId, seq: 2 });
+  const before = [...session.surface.nodes];
+  assert.deepEqual(before, [0, 1, 2, 3]);
+
+  const result = await registerRecall.recall(ctx, { sessionId, seq: 2, scope: 'from' });
 
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(result.startSeq, 2);
   assert.equal(result.endSeq, 3);
-  assert.equal(result.text, '第二条', '原文必须回传给输入框');
-  assert.equal(result.recalledCount, 2);
+  assert.equal(result.text, '第二条');
+  assert.equal(result.cleared, true, '派生消息里不应再残留原文');
 
-  // 追加了一条表面替换事件。
-  assert.equal(session.appended.length, 1);
-  const marker = session.appended[0];
-  assert.equal(marker.type, 'user/message');
-  assert.deepEqual(marker.surfaceOp, { op: 'replace', startSeq: 2, endSeq: 3 });
-  assert.deepEqual(marker.sourceEventSeqs, [2, 3]);
-  assert.ok(String(marker.data.id).startsWith('recall-'));
+  // 表面：0,1 保留，2,3 被移除，最后是撤回标记。
+  const after = session.surface.nodes;
+  assert.ok(!after.includes(2), '目标必须离开表面');
+  assert.ok(!after.includes(3), '其后节点必须离开表面');
+  assert.deepEqual(after.slice(0, 2), [0, 1]);
 
-  // 派生消息里不得残留撤回标记。
-  const derived = session.deriveMessages();
-  assert.ok(
-    derived.every((message) => !String(message?.id ?? '').startsWith('recall-')),
-    '撤回标记不得进入模型消息',
-  );
+  // 派生缓存必须被清掉（否则请求带旧历史会被拒）。
+  assert.deepEqual(session.derived, []);
+  assert.equal(session.derivedNodes, 0);
+  assert.equal(session.derivedGeneration, -1);
 });
 
-test('撤回首条消息时保留系统提示（startSeq 不小于首个表面节点）', async () => {
-  const sessionId = 'session-test-2';
-  const session = makeSession([
-    { type: 'system/message', seq: 0, time: 1, surfaceOp: 'append', data: { turn: 0, step: 0, content: [{ type: 'text', text: 'sys' }] } },
-    userEvent(1, 'u1', '你好'),
-    assistantEvent(2, 'a1', '你好'),
-  ]);
-  const ctx = makeCtx(session, sessionId);
-
-  const result = await registerRecall.recall(ctx, { sessionId, seq: 1 });
-  assert.equal(result.ok, true, JSON.stringify(result));
-  assert.equal(result.startSeq, 1, '系统提示必须留在表面之外');
-  assert.equal(result.endSeq, 2);
-});
-
-test('重复撤回同一位置返回 already-recalled', async () => {
-  const sessionId = 'session-test-3';
-  const session = makeSession([
-    userEvent(0, 'u1', '要撤回'),
-    assistantEvent(1, 'a1', '收到'),
-  ]);
-  const ctx = makeCtx(session, sessionId);
-
-  const first = await registerRecall.recall(ctx, { sessionId, seq: 0 });
-  assert.equal(first.ok, true);
-
-  // 第二次：0 已在遮蔽区间内，表面只剩撤回标记。
-  const second = await registerRecall.recall(ctx, { sessionId, seq: 0 });
-  assert.equal(second.ok, false);
-  assert.equal(second.code, 'already-recalled');
-});
-
-test('status 只列出仍在表面上的用户消息', async () => {
-  const sessionId = 'session-test-4';
-  const session = makeSession([
-    userEvent(0, 'u1', '保留'),
-    assistantEvent(1, 'a1', '好的'),
-  ]);
-  const ctx = makeCtx(session, sessionId);
-
-  const before = await registerRecall.status(ctx, { sessionId });
-  assert.equal(before.ok, true);
-  assert.deepEqual(before.recallable.map((item) => item.seq), [0]);
-
-  await registerRecall.recall(ctx, { sessionId, seq: 0 });
-  const after = await registerRecall.status(ctx, { sessionId });
-  assert.deepEqual(after.recallable.map((item) => item.seq), []);
-});
-
-test('scope=only 只撤这一条，后续消息保留', async () => {
-  const sessionId = 'session-test-5';
+test('scope=only 撤回本条及其助手回复，后续提问保留', async () => {
+  const sessionId = 'session-only';
   const session = makeSession([
     userEvent(0, 'u1', '第一条'),
     assistantEvent(1, 'a1', '回复一'),
@@ -176,19 +133,49 @@ test('scope=only 只撤这一条，后续消息保留', async () => {
 
   const result = await registerRecall.recall(ctx, { sessionId, seq: 2, scope: 'only' });
   assert.equal(result.ok, true, JSON.stringify(result));
-  assert.equal(result.scope, 'only');
   assert.equal(result.startSeq, 2);
-  assert.equal(result.endSeq, 2, '仅撤回本条时区间只覆盖这一个节点');
-  assert.equal(result.recalledCount, 1);
-  assert.equal(result.text, '第二条');
+  assert.equal(result.endSeq, 3, '必须连它引出的助手回复一起撤');
+  assert.equal(result.recalledCount, 2, '用户消息 + 助手回复');
 
-  // 第一条、回复一、回复二 都仍在表面上。
-  const after = await registerRecall.status(ctx, { sessionId });
-  assert.deepEqual(after.recallable.map((item) => item.seq), [0]);
+  const after = session.surface.nodes;
+  assert.ok(!after.includes(2), '目标离开表面');
+  assert.ok(!after.includes(3), '助手回复也离开表面');
+  assert.ok(after.includes(0) && after.includes(1), '更早的一轮保留');
 });
 
-test('scope=from 是默认行为，撤回本条及其之后', async () => {
-  const sessionId = 'session-test-6';
+test('系统提示永不被撤回', async () => {
+  const sessionId = 'session-sys';
+  const session = makeSession([
+    { type: 'system/message', seq: 0, time: 1, surfaceOp: 'append', data: { turn: 0, step: 0, content: [{ type: 'text', text: 'sys' }] } },
+    userEvent(1, 'u1', '你好'),
+    assistantEvent(2, 'a1', '你好'),
+  ]);
+  const ctx = makeCtx(session, sessionId);
+
+  const result = await registerRecall.recall(ctx, { sessionId, seq: 1 });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.startSeq, 1);
+  assert.ok(session.surface.nodes.includes(0), 'system/message 必须留在表面');
+});
+
+test('重复撤回同一位置返回 already-recalled', async () => {
+  const sessionId = 'session-dup';
+  const session = makeSession([
+    userEvent(0, 'u1', '要撤回'),
+    assistantEvent(1, 'a1', '收到'),
+  ]);
+  const ctx = makeCtx(session, sessionId);
+
+  const first = await registerRecall.recall(ctx, { sessionId, seq: 0, scope: 'from' });
+  assert.equal(first.ok, true, JSON.stringify(first));
+
+  const second = await registerRecall.recall(ctx, { sessionId, seq: 0, scope: 'from' });
+  assert.equal(second.ok, false);
+  assert.equal(second.code, 'already-recalled');
+});
+
+test('默认范围是 only：撤回本条及助手回复，不清空后续提问', async () => {
+  const sessionId = 'session-default-only';
   const session = makeSession([
     userEvent(0, 'u1', '第一条'),
     assistantEvent(1, 'a1', '回复一'),
@@ -197,10 +184,70 @@ test('scope=from 是默认行为，撤回本条及其之后', async () => {
   ]);
   const ctx = makeCtx(session, sessionId);
 
-  const result = await registerRecall.recall(ctx, { sessionId, seq: 2 });
-  assert.equal(result.ok, true);
-  assert.equal(result.scope, 'from');
+  const result = await registerRecall.recall(ctx, { sessionId, seq: 0 });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.scope, 'only', '默认必须是 only');
+  assert.equal(result.startSeq, 0);
+  assert.equal(result.endSeq, 1, '只覆盖这一轮（提问 + 回复）');
+
+  const after = session.surface.nodes;
+  assert.ok(!after.includes(0), '目标离开表面');
+  assert.ok(after.includes(2) && after.includes(3), '后续一轮必须保留');
+});
+
+test('按 messageId 精确定位（客户端主路径）', async () => {
+  const sessionId = 'session-by-id';
+  const session = makeSession([
+    userEvent(0, 'id-a', '同样的文字'),
+    assistantEvent(1, 'a1', '回复'),
+    userEvent(2, 'id-b', '同样的文字'),
+  ]);
+  const ctx = makeCtx(session, sessionId);
+
+  const result = await registerRecall.recall(ctx, { sessionId, messageId: 'id-b', scope: 'only' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.startSeq, 2, '必须命中 id-b 这条，而不是同文本的另一条');
+});
+
+test('按文本定位可以撤回（必须指定会话）', async () => {
+  const sessionId = 'session-text';
+  const session = makeSession([
+    userEvent(0, 'u1', '第一条'),
+    assistantEvent(1, 'a1', '回复一'),
+    userEvent(2, 'u2', '要撤回的这句'),
+  ]);
+  const ctx = makeCtx(session, sessionId);
+
+  const result = await registerRecall.recall(ctx, { sessionId, text: '要撤回的这句', scope: 'only' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.sessionId, sessionId);
   assert.equal(result.startSeq, 2);
-  assert.equal(result.endSeq, 3);
-  assert.equal(result.recalledCount, 2);
+  assert.equal(result.text, '要撤回的这句');
+});
+
+test('不带会话 id 时拒绝执行，避免跨会话误命中', async () => {
+  const sessionId = 'session-no-id';
+  const session = makeSession([userEvent(0, 'u1', '要撤回')]);
+  const ctx = makeCtx(session, sessionId);
+
+  const result = await registerRecall.recall(ctx, { text: '要撤回', scope: 'only' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'no-session');
+});
+
+test('status 只列出仍在表面上的用户消息', async () => {
+  const sessionId = 'session-status';
+  const session = makeSession([
+    userEvent(0, 'u1', '保留'),
+    assistantEvent(1, 'a1', '好的'),
+  ]);
+  const ctx = makeCtx(session, sessionId);
+
+  const before = await registerRecall.status(ctx, { sessionId });
+  assert.equal(before.ok, true);
+  assert.deepEqual(before.recallable.map((row) => row.seq), [0]);
+
+  await registerRecall.recall(ctx, { sessionId, seq: 0 });
+  const after = await registerRecall.status(ctx, { sessionId });
+  assert.deepEqual(after.recallable.map((row) => row.seq), []);
 });

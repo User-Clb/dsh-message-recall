@@ -77,6 +77,146 @@ function mergePayload(url, body) {
   return merged;
 }
 
+/** 只读诊断：报告宿主能看到哪些会话与服务。 */
+function probeSessions(ctx) {
+  const out = { services: {}, sessions: [] };
+  for (const name of ['sessions', 'sessionController', 'agents', 'webServer']) {
+    try {
+      out.services[name] = Boolean(ctx.get(name, false));
+    } catch {
+      out.services[name] = 'throw';
+    }
+  }
+  try {
+    const sessions = ctx.get('sessions', false);
+    const list = sessions?.list?.() ?? [];
+    out.count = Array.isArray(list) ? list.length : -1;
+    for (const session of (Array.isArray(list) ? list : []).slice(0, 8)) {
+      let events = -1;
+      try {
+        events = (session?.snapshotEvents?.() ?? []).length;
+      } catch {
+        events = 'throw';
+      }
+      out.sessions.push({
+        id: session?.id ?? session?.header?.id ?? '(none)',
+        events,
+      });
+    }
+  } catch (error) {
+    out.error = String(error?.message ?? error);
+  }
+  return out;
+}
+
+/**
+ * 只读审计：列出会话里所有撤回标记及其遮蔽跨度。
+ *
+ * 用来核对「我到底遮蔽了多少」——跨度异常大就说明目标定位错了。
+ *
+ * @param ctx - Host 根上下文。
+ * @param payload - `{ sessionId? }`。
+ */
+function auditMarkers(ctx, payload) {
+  const sessions = ctx.get('sessions', false);
+  const list = sessions?.list?.() ?? [];
+  const wanted = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+
+  const out = [];
+  for (const session of list) {
+    const id = session?.id ?? session?.header?.id;
+    if (typeof id !== 'string' || !id) continue;
+    if (wanted && id !== wanted) continue;
+
+    let events = [];
+    try {
+      events = [...(session?.snapshotEvents?.() ?? [])];
+    } catch {
+      events = [];
+    }
+
+    const markers = [];
+    for (const event of events) {
+      const markerId = event?.data?.id;
+      if (typeof markerId !== 'string') continue;
+      if (markerId.indexOf('rewind-') !== 0) continue;
+      const op = event.surfaceOp;
+      if (!op || op === 'append' || op.op !== 'replace') continue;
+      const span = Number(op.endSeq) - Number(op.startSeq) + 1;
+      markers.push({
+        markerSeq: Number(event.seq),
+        startSeq: Number(op.startSeq),
+        endSeq: Number(op.endSeq),
+        span,
+        sources: Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs.length : 0,
+      });
+    }
+
+    out.push({
+      sessionId: id,
+      eventCount: events.length,
+      markerCount: markers.length,
+      markers: markers.slice(-10),
+    });
+  }
+  return { ok: true, sessions: out };
+}
+
+/**
+ * 只读诊断：报告模型实际会看到的派生消息（deriveMessages 的真实结果）。
+ *
+ * 这是判断「撤回有没有真的进到模型上下文」的唯一可靠依据：
+ * 表面节点变了但派生消息没变，就等于没撤回。
+ *
+ * @param ctx - Host 根上下文。
+ * @param payload - `{ sessionId?, tail? }`。
+ */
+function inspectDerived(ctx, payload) {
+  const sessions = ctx.get('sessions', false);
+  const list = sessions?.list?.() ?? [];
+  const wanted = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  const tail = Number.isFinite(Number(payload?.tail)) ? Number(payload.tail) : 12;
+
+  const out = [];
+  for (const session of list) {
+    const id = session?.id ?? session?.header?.id;
+    if (typeof id !== 'string' || !id) continue;
+    if (wanted && id !== wanted) continue;
+
+    let messages = [];
+    try {
+      messages = session?.deriveMessages?.() ?? [];
+    } catch (error) {
+      out.push({ sessionId: id, error: String(error?.message ?? error) });
+      continue;
+    }
+
+    const flat = (message) => {
+      const content = message?.content;
+      if (typeof content === 'string') return content;
+      if (!Array.isArray(content)) return '';
+      return content.map((block) => (typeof block?.text === 'string' ? block.text : '')).join('');
+    };
+
+    out.push({
+      sessionId: id,
+      surfaceNodes: Array.isArray(session?.surface?.nodes) ? session.surface.nodes.length : -1,
+      messageCount: messages.length,
+      roles: messages.reduce((acc, message) => {
+        const role = String(message?.role ?? '?');
+        acc[role] = (acc[role] ?? 0) + 1;
+        return acc;
+      }, {}),
+      tail: messages.slice(-tail).map((message) => ({
+        role: message?.role ?? '?',
+        id: message?.id ?? null,
+        text: flat(message).slice(0, 80),
+      })),
+    });
+  }
+  return { ok: true, sessions: out };
+}
+
 async function handleRequest(request, response, ctx) {
   try {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
@@ -93,6 +233,18 @@ async function handleRequest(request, response, ctx) {
 
     if (action === 'status') {
       sendJson(response, 200, await registerRecall.status(ctx, payload));
+      return;
+    }
+    if (action === 'audit') {
+      sendJson(response, 200, auditMarkers(ctx, payload));
+      return;
+    }
+    if (action === 'derived') {
+      sendJson(response, 200, inspectDerived(ctx, payload));
+      return;
+    }
+    if (action === 'probe') {
+      sendJson(response, 200, probeSessions(ctx));
       return;
     }
     if (action === 'recall') {
