@@ -1,0 +1,12 @@
+# dsh-message-recall 的组合包 patch 层。
+#
+# 只需要一行 Host 行：dsh-client-modules 会扫描宿主 Loader 中声明了
+# `dsh.client` 的包，自动把 exports["./client"] 编进浏览器启动图，
+# 因此 client.cjs 无需单独一行。
+#
+# Host 行注入 sessions / sessionController，用于把撤回落到会话表面
+# （surfaceOp: replace）并清空被撤回的入站队列项。
+- insert:
+    - id: dsh-message-recall
+      name: dsh-message-recall
+      inject: [sessions, sessionController]

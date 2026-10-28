@@ -1,0 +1,9 @@
+{
+  "name": "dsh-message-recall",
+  "description": "Message recall for DeepSeek Harness: a recall button on every user message bubble that really removes the message and everything after it from the conversation and the model context, then puts the original text back into the composer. One client bundle serves both the Web GUI and the desktop client.",
+  "version": "0.1.0",
+  "entry": {
+    "name": "dsh-message-recall",
+    "inject": ["sessions", "sessionController"]
+  }
+}

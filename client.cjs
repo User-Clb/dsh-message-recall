@@ -1,0 +1,447 @@
+// dsh-message-recall 客户端半。
+//
+// 两部分能力：
+//
+// A. 撤回按钮 —— 覆盖用户消息节点（keyed slot "user"，priority -1 优先于官方），
+//    气泡正文仍走官方 Factory `conversation.chat.user.content`（样式不变），
+//    在正文下方自绘一条操作条，复制按钮之后就是撤回按钮。
+//
+// B. 真撤回 —— 官方 ConversationNodeAssembler 在重建窗口时不会剔除被
+//    `surfaceOp: replace` 遮蔽的旧事件，导致气泡只是"看不见"而仍在场。
+//    这里给装配器打补丁，在 replaceWindow / append 入口按撤回区间过滤，
+//    使被撤回的事件真正退出会话视图（与 Host 侧 deriveMessages 截断同语义）。
+window.__ModuleLoader__.load({
+  id: "dsh-message-recall",
+  factory: (require) => {
+    const React = require("react");
+    const h = React.createElement;
+
+    const NAME = "dsh-message-recall";
+    const RPC_METHOD = "plugin-rpc/dsh-message-recall";
+    const NS = "message-recall";
+
+    /* ================================================================ */
+    /* RPC                                                              */
+    /* ================================================================ */
+
+    function rpcOf(ctx) {
+      const connection = ctx?.get?.("connection", false) ?? ctx?.connection;
+      const rpc = connection?.rpc;
+      return rpc && typeof rpc.call === "function" ? rpc : null;
+    }
+
+    function signalOf(ms) {
+      return typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(ms)
+        : undefined;
+    }
+
+    async function callRpc(ctx, endpoint, payload, timeoutMs = 60000) {
+      const rpc = rpcOf(ctx);
+      if (!rpc) throw new Error("connection.rpc 不可用");
+      const response = await rpc.call("/api", RPC_METHOD, { endpoint, payload }, signalOf(timeoutMs));
+      if (!response || response.ok !== true) {
+        const error = response?.error;
+        throw new Error(`${String(error?.code ?? "unknown")} ${String(error?.message ?? "")}`.trim());
+      }
+      return response.value;
+    }
+
+    /* ================================================================ */
+    /* 撤回标记识别与窗口过滤                                            */
+    /* ================================================================ */
+
+    /** 该事件是否是本插件写入的撤回标记。 */
+    function isRecallMarker(event) {
+      if (!event || event.type !== "user/message") return false;
+      const op = event.surfaceOp;
+      if (!op || typeof op !== "object" || op.op !== "replace") return false;
+      const id = event?.data?.id;
+      return typeof id === "string" && id.indexOf("recall-") === 0;
+    }
+
+    /**
+     * 从窗口条目里剔除被撤回的事件。
+     *
+     * 撤回标记覆盖 [startSeq, markerSeq]：区间内的事件连同标记本身
+     * 都不再参与会话视图装配。
+     *
+     * @param entries - 装配器窗口条目。
+     * @returns 过滤后的条目（无撤回标记时原样返回）。
+     */
+    function dropRecalled(entries) {
+      const list = Array.isArray(entries) ? entries : [...(entries ?? [])];
+      const hidden = new Set();
+      let marked = false;
+
+      for (const entry of list) {
+        const event = entry?.event;
+        if (!isRecallMarker(event)) continue;
+        marked = true;
+        const start = Number(event.surfaceOp.startSeq);
+        const end = Number(event.seq);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+        for (let seq = start; seq <= end; seq += 1) hidden.add(seq);
+        if (Array.isArray(event.sourceEventSeqs)) {
+          for (const source of event.sourceEventSeqs) {
+            if (typeof source === "number") hidden.add(source);
+          }
+        }
+      }
+
+      if (!marked) return list;
+      return list.filter((entry) => {
+        const seq = entry?.event?.seq;
+        return typeof seq === "number" && !hidden.has(seq);
+      });
+    }
+
+    /** 给一个装配器实例打上过滤补丁。 */
+    function patchAssembler(assembler) {
+      if (!assembler || assembler.__dshRecallPatched) return assembler;
+      assembler.__dshRecallPatched = true;
+
+      const replaceWindow = assembler.replaceWindow?.bind(assembler);
+      const append = assembler.append?.bind(assembler);
+
+      if (typeof replaceWindow === "function") {
+        assembler.replaceWindow = function recallReplaceWindow(entries, hasMore) {
+          return replaceWindow(dropRecalled(entries), hasMore);
+        };
+      }
+
+      if (typeof append === "function") {
+        assembler.append = function recallAppend(record) {
+          // 撤回标记到达：按当前窗口重建，被撤回的气泡立即消失。
+          if (isRecallMarker(record?.event) && typeof assembler.replaceWindow === "function") {
+            const current = assembler.inputs instanceof Map ? [...assembler.inputs.values()] : [];
+            return assembler.replaceWindow([...current, record], assembler.hasMore === true);
+          }
+          return append(record);
+        };
+      }
+
+      return assembler;
+    }
+
+    /* ================================================================ */
+    /* 视图                                                             */
+    /* ================================================================ */
+
+    const zh = {
+      recall: "撤回这条及之后的消息",
+      busy: "撤回中…",
+      copy: "复制",
+      copied: "已复制",
+      failed: "撤回失败",
+    };
+    const en = {
+      recall: "Recall this and everything after",
+      busy: "Recalling…",
+      copy: "Copy",
+      copied: "Copied",
+      failed: "Recall failed",
+    };
+
+    const styles = {
+      row: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "flex-end",
+        gap: "4px",
+        minHeight: "20px",
+      },
+      iconButton: {
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: "20px",
+        height: "20px",
+        padding: "0",
+        border: "0",
+        borderRadius: "5px",
+        background: "transparent",
+        color: "inherit",
+        cursor: "pointer",
+        opacity: 0.55,
+        lineHeight: 1,
+        transition: "opacity 120ms ease",
+      },
+      time: {
+        fontSize: "11px",
+        opacity: 0.5,
+        marginRight: "2px",
+        whiteSpace: "nowrap",
+      },
+      notice: {
+        fontSize: "11px",
+        opacity: 0.8,
+        marginRight: "4px",
+      },
+    };
+
+    function CopyGlyph({ copied }) {
+      return copied
+        ? h("svg", { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", "aria-hidden": "true" },
+            h("path", { d: "M3.5 8.5 6.5 11.5 12.5 5", stroke: "currentColor", strokeWidth: 1.4, strokeLinecap: "round", strokeLinejoin: "round" }))
+        : h("svg", { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", "aria-hidden": "true" },
+            h("rect", { x: 5.5, y: 5.5, width: 8, height: 8, rx: 2, stroke: "currentColor", strokeWidth: 1.2 }),
+            h("path", { d: "M10.5 5.5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v4.5a2 2 0 0 0 2 2h1.5", stroke: "currentColor", strokeWidth: 1.2, strokeLinecap: "round" }));
+    }
+
+    function RecallGlyph() {
+      return h("svg", { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", "aria-hidden": "true" },
+        h("path", {
+          d: "M6.2 3.4 2.2 6.9l4 3.5V8.1h2.9c2.2 0 3.7 1.1 4.7 2.9-.3-3.1-2.2-5.3-4.7-5.3H6.2V3.4Z",
+          stroke: "currentColor",
+          strokeWidth: 1.2,
+          strokeLinejoin: "round",
+          strokeLinecap: "round",
+        }));
+    }
+
+    /** 把 text 写进剪贴板。 */
+    function writeClipboard(text) {
+      if (navigator.clipboard?.writeText) {
+        return navigator.clipboard.writeText(text).then(() => true, () => false);
+      }
+      try {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        const ok = document.execCommand("copy");
+        area.remove();
+        return Promise.resolve(ok);
+      } catch {
+        return Promise.resolve(false);
+      }
+    }
+
+    /** 从内容块拼出纯文本。 */
+    function textOf(content) {
+      if (typeof content === "string") return content;
+      if (!Array.isArray(content)) return "";
+      return content.map((block) => (typeof block?.text === "string" ? block.text : "")).join("");
+    }
+
+    /** 把消息内容整理成官方 Factory 需要的形状。 */
+    function prepareContent(data) {
+      const texts = [];
+      const attachments = [];
+      const extraBlocks = [];
+      for (const block of Array.isArray(data?.content) ? data.content : []) {
+        if (!block) continue;
+        if (block.type === "text" && typeof block.text === "string") texts.push(block.text);
+        else if (block.type === "image" && block.attachment !== undefined) {
+          attachments.push({ type: "image", image: { attachment: block.attachment } });
+        } else if (block.type === "file" && block.attachment !== undefined) {
+          attachments.push({ type: "file", file: block.attachment });
+        } else extraBlocks.push(block);
+      }
+      return {
+        text: texts.join(""),
+        attachments,
+        extraBlocks,
+        referenceLabels: Array.isArray(data?.referenceLabels) ? data.referenceLabels : [],
+      };
+    }
+
+    /** 本地时间 HH:MM。 */
+    function clockOf(time) {
+      if (typeof time !== "number") return "";
+      try {
+        return new Date(time).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+      } catch {
+        return "";
+      }
+    }
+
+    /* ================================================================ */
+    /* 插件                                                             */
+    /* ================================================================ */
+
+    function apply(ctx) {
+      const t = (key) => (ctx.locale?.text?.(NS, key) ?? zh[key] ?? key);
+
+      ctx.effect(() => ctx.locale?.register?.(NS, { zh, en }), "dsh-message-recall: dictionaries");
+
+      /** 当前会话 id：官方 UI Workspace 的持久化选择。 */
+      function currentSessionId() {
+        try {
+          const workspace = ctx.get("uiWorkspace", false);
+          const selected = workspace?.selection?.getSnapshot?.()?.sessionId;
+          if (typeof selected === "string" && selected) return selected;
+        } catch {
+          /* 忽略 */
+        }
+        return "";
+      }
+
+      /** 执行撤回：Host 截断表面，再把原文回填输入框。 */
+      async function recall(sessionId, seq, fallbackText, setDraft) {
+        const result = await callRpc(ctx, "recall", { sessionId, seq });
+        if (!result || result.ok !== true) throw new Error(result?.message ?? t("failed"));
+        const text = typeof result.text === "string" && result.text !== "" ? result.text : (fallbackText ?? "");
+        if (text && typeof setDraft === "function") setDraft(text);
+        return result;
+      }
+
+      /* ---------- 用户消息节点（气泡 + 操作条） ---------- */
+
+      function UserRecallNodeView(props) {
+        const { node, renderFactorySlot, loadImage, t: translate, inputActions } = props;
+        const data = node?.data ?? {};
+        const content = React.useMemo(() => prepareContent(data), [data]);
+        const plain = content.text;
+        // uiSession.provide 把 inputActions 作为 Session 作用域标准 prop 下发。
+        const setDraft = typeof inputActions?.setDraft === "function"
+          ? (text) => inputActions.setDraft(text)
+          : undefined;
+
+        const [copied, setCopied] = React.useState(false);
+        const [phase, setPhase] = React.useState("idle");
+        const [error, setError] = React.useState(null);
+
+        const copy = React.useCallback(
+          (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            writeClipboard(plain).then((ok) => {
+              if (!ok) return;
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1200);
+            });
+          },
+          [plain],
+        );
+
+        const run = React.useCallback(
+          async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (phase === "busy") return;
+            const sessionId = currentSessionId();
+            if (!sessionId) {
+              setError(t("failed"));
+              return;
+            }
+            setPhase("busy");
+            setError(null);
+            try {
+              await recall(sessionId, Number(data.seq), plain, setDraft);
+              setPhase("done");
+            } catch (cause) {
+              setPhase("idle");
+              setError(String(cause?.message ?? cause));
+            }
+          },
+          [data.seq, phase, plain, setDraft, t],
+        );
+
+        const clock = clockOf(data.time);
+        const copyLabel = copied ? (translate?.("copied") ?? t("copied")) : (translate?.("copy") ?? t("copy"));
+        const recallLabel = phase === "busy" ? t("busy") : t("recall");
+
+        return h(
+          "div",
+          { style: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "6px" } },
+          renderFactorySlot("conversation.chat.user.content", {
+            content,
+            loadImage,
+            facts: {},
+            interactive: true,
+          }),
+          h(
+            "div",
+            { style: styles.row, "data-dsh-recall-row": "" },
+            error !== null ? h("span", { style: styles.notice, role: "status" }, error) : null,
+            clock ? h("span", { style: styles.time }, clock) : null,
+            phase === "done"
+              ? null
+              : h(
+                  "button",
+                  {
+                    type: "button",
+                    title: recallLabel,
+                    "aria-label": recallLabel,
+                    "data-dsh-recall-button": "",
+                    disabled: phase === "busy",
+                    onClick: run,
+                    style: styles.iconButton,
+                    onMouseEnter: (e) => { e.currentTarget.style.opacity = "1"; },
+                    onMouseLeave: (e) => { e.currentTarget.style.opacity = "0.55"; },
+                  },
+                  h(RecallGlyph, {}),
+                ),
+            h(
+              "button",
+              {
+                type: "button",
+                title: copyLabel,
+                "aria-label": copyLabel,
+                onClick: copy,
+                style: styles.iconButton,
+                onMouseEnter: (e) => { e.currentTarget.style.opacity = "1"; },
+                onMouseLeave: (e) => { e.currentTarget.style.opacity = "0.55"; },
+              },
+              h(CopyGlyph, { copied }),
+            ),
+          ),
+        );
+      }
+
+      /* ---------- 注册 ---------- */
+
+      ctx.slots.inject("conversation.chat.node", () => ctx.slots.register(
+        {
+          name: "conversation.chat.node",
+          key: "user",
+          // 比官方条目（默认 0）更低的 priority 优先渲染。
+          priority: -1,
+          locale: NS,
+        },
+        UserRecallNodeView,
+      ));
+
+      /* ---------- 装配器补丁：让被撤回的事件真正消失 ---------- */
+
+      ctx.inject(["uiConversation"], (scope) => {
+        scope.effect(() => {
+          const conversation = scope.uiConversation;
+          if (!conversation || typeof conversation.binding !== "function") return;
+
+          const original = conversation.binding.bind(conversation);
+          conversation.binding = function bindingWithRecall(source) {
+            const binding = original(source);
+            if (binding?.assembler) patchAssembler(binding.assembler);
+            return binding;
+          };
+
+          // 已建立的绑定也补一次。
+          try {
+            for (const record of conversation.bindings?.values?.() ?? []) {
+              if (record?.binding?.assembler) patchAssembler(record.binding.assembler);
+            }
+          } catch {
+            /* 忽略 */
+          }
+
+          return () => {
+            conversation.binding = original;
+          };
+        }, "dsh-message-recall: assembler filter");
+      });
+    }
+
+    return {
+      name: NAME,
+      inject: ["slots", "locale"],
+      apply,
+      /** 内部纯函数出口，供离线测试验证窗口过滤语义。 */
+      __test: { dropRecalled, isRecallMarker, patchAssembler },
+    };
+  },
+});

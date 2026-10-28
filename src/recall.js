@@ -1,0 +1,292 @@
+/**
+ * dsh-message-recall 核心逻辑（Host 侧）。
+ *
+ * 「真正撤回」的落点有两处，缺一不可：
+ *
+ * 1) 模型上下文：在会话日志尾部追加一条表面替换事件
+ *    （surfaceOp: { op: 'replace', startSeq, endSeq }），
+ *    与官方 compaction checkpoint 同一条通道。session.deriveMessages
+ *    立即从该点截断，下一轮请求不再包含被撤回的消息。
+ *    替换事件自身通过 id 前缀 `recall-` 在派生时被过滤，不进上下文。
+ *
+ * 2) 会话记录：被遮蔽的事件仍留在追加式日志里（可审计、可恢复），
+ *    但不再参与“当前表面”。客户端装配器按同一规则剔除它们，
+ *    因此聊天视图里气泡真正消失，而不是只做视觉隐藏。
+ *
+ * 另外清掉入站队列里尚未发出的消息，避免撤回后又被旧内容唤醒。
+ */
+
+/** 从 ctx 取服务，缺省安全。 */
+function service(ctx, name) {
+  try {
+    return ctx.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 表面可参与的事件类型（与 dsh-session 的 SURFACE_EVENT_TYPES 一致）。 */
+const SURFACE_TYPES = new Set([
+  'system/message',
+  'developer/message',
+  'user/message',
+  'assistant/message',
+  'tool/result',
+]);
+
+/** 撤回标记事件的 id 前缀。 */
+const RECALL_PREFIX = 'recall-';
+
+function asEvents(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value[Symbol.iterator] === 'function') {
+    try {
+      return [...value];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+/** 会话日志读取：优先活会话快照，其次控制器 inspect，最后查询服务。 */
+async function readLog(ctx, sessionId) {
+  const sessions = service(ctx, 'sessions');
+  const live = sessions?.get?.(sessionId);
+  if (live?.snapshotEvents) {
+    return { events: asEvents(live.snapshotEvents()), session: live };
+  }
+
+  const controller = service(ctx, 'sessionController');
+  if (typeof controller?.inspect === 'function') {
+    const inspected = await controller.inspect(sessionId);
+    return { events: asEvents(inspected?.events), session: live ?? null };
+  }
+
+  const query = service(ctx, 'sessionQuery');
+  if (typeof query?.observeSession === 'function') {
+    const observed = await query.observeSession(sessionId, { projectionMode: 'none' });
+    try {
+      return { events: asEvents(observed?.events), session: live ?? null };
+    } finally {
+      observed?.[Symbol.dispose]?.();
+    }
+  }
+
+  return { events: asEvents(live?.snapshotEvents?.() ?? []), session: live ?? null };
+}
+
+/** 从 user/message 事件提取纯文本。 */
+function userTextOf(event) {
+  const content = event?.data?.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((block) => {
+      if (!block) return '';
+      if (typeof block === 'string') return block;
+      return typeof block.text === 'string' ? block.text : '';
+    })
+    .join('');
+}
+
+function isRecallMarker(event) {
+  if (event?.type !== 'user/message') return false;
+  const id = event?.data?.id;
+  return typeof id === 'string' && id.startsWith(RECALL_PREFIX);
+}
+
+/** 一条事件是否是“人类用户发出的消息”。 */
+function isHumanUserEvent(event) {
+  if (event?.type !== 'user/message') return false;
+  if (isRecallMarker(event)) return false;
+  const kind = event.data?.source?.kind;
+  if (kind !== undefined && kind !== 'user') return false;
+  return userTextOf(event) !== '';
+}
+
+/**
+ * 按表面替换规则折叠出“当前表面”的节点序列。
+ *
+ * @param events - 完整事件日志（按 seq 升序）。
+ * @returns 当前表面事件的 seq 数组（升序）。
+ */
+export function foldSurfaceNodes(events) {
+  const nodes = [];
+  for (const event of events) {
+    if (!SURFACE_TYPES.has(event?.type)) continue;
+    const op = event.surfaceOp;
+    if (op === 'append' || op === undefined) {
+      nodes.push(Number(event.seq));
+      continue;
+    }
+    if (typeof op !== 'object' || op === null) continue;
+    if (op.op !== 'replace') continue;
+    const start = Number(op.startSeq);
+    const end = Number(op.endSeq);
+    for (let index = nodes.length - 1; index >= 0; index -= 1) {
+      if (nodes[index] >= start && nodes[index] <= end) nodes.splice(index, 1);
+    }
+    nodes.push(Number(event.seq));
+  }
+  return nodes.sort((left, right) => left - right);
+}
+
+/** 把模型派生消息里的撤回标记过滤掉。 */
+function wrapDerive(session) {
+  if (!session || typeof session.deriveMessages !== 'function' || session.__recallWrapped) return session;
+  const original = session.deriveMessages.bind(session);
+  session.deriveMessages = function deriveMessagesWithoutRecallMarkers() {
+    const messages = original();
+    if (!Array.isArray(messages)) return messages;
+    return messages.filter((message) => {
+      const id = message?.id;
+      return !(typeof id === 'string' && id.startsWith(RECALL_PREFIX));
+    });
+  };
+  session.__recallWrapped = true;
+  return session;
+}
+
+/** 让下一次请求重新组装（撤回后不复用上一轮的请求头序列）。 */
+function resetRequestSeries(ctx, sessionId) {
+  const agents = service(ctx, 'agents');
+  const agent = agents?.get?.(sessionId) ?? agents?.agent?.(sessionId);
+  if (!agent) return;
+  try { agent.requestHeaderLogged = false; } catch { /* ignore */ }
+  try { agent.requestSurfaceGeneration = -1; } catch { /* ignore */ }
+  try { agent.frozenMessages?.clear?.(); } catch { /* ignore */ }
+}
+
+/** 清掉入站队列里尚未发出的消息。 */
+async function disarmInbox(ctx, sessionId) {
+  const controller = service(ctx, 'sessionController');
+  const agents = service(ctx, 'agents');
+  const agent = agents?.get?.(sessionId);
+  const ids = [];
+  try {
+    for (const message of [...(agent?.inbox?.nextTurn ?? []), ...(agent?.inbox?.nextStep ?? [])]) {
+      if (message?.id) ids.push(message.id);
+    }
+  } catch { /* ignore */ }
+  for (const id of ids) {
+    try {
+      await controller?.updateQueue?.({ sessionId, itemId: id, action: { kind: 'remove' } });
+    } catch { /* ignore */ }
+  }
+}
+
+/** 若该轮还在运行，先停掉，避免撤回后旧回合继续写回。 */
+async function stopRunningTurn(ctx, sessionId) {
+  const agents = service(ctx, 'agents');
+  const agent = agents?.get?.(sessionId);
+  const phase = agent?.phase?.kind;
+  if (!phase || phase === 'idle') return false;
+  try {
+    await agent?.cancel?.({ kind: 'user' }, { keepInbox: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 撤回一条用户消息及其之后的所有内容。
+ *
+ * @param ctx - Host 根上下文。
+ * @param payload - `{ sessionId, seq?, messageId? }`。
+ * @returns 撤回结果，含回填输入框所需的原文。
+ */
+async function recall(ctx, payload) {
+  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  if (!sessionId) return { ok: false, code: 'no-session', message: '没有当前会话' };
+
+  const stopped = await stopRunningTurn(ctx, sessionId);
+
+  const { events, session } = await readLog(ctx, sessionId);
+  if (events.length === 0 && !session) {
+    return { ok: false, code: 'session-not-found', message: '找不到该会话' };
+  }
+
+  const nodes = foldSurfaceNodes(events);
+  if (nodes.length === 0) return { ok: false, code: 'empty-surface', message: '没有可撤回的消息' };
+
+  const wantedId = typeof payload?.messageId === 'string' ? payload.messageId : '';
+  const wantedSeq = Number.isFinite(Number(payload?.seq)) ? Number(payload.seq) : undefined;
+
+  let targetSeq;
+  if (wantedId) {
+    const hit = events.find((event) => event?.type === 'user/message' && event.data?.id === wantedId);
+    if (hit) targetSeq = Number(hit.seq);
+  }
+  if (targetSeq === undefined && wantedSeq !== undefined) targetSeq = wantedSeq;
+  if (targetSeq === undefined) return { ok: false, code: 'target-missing', message: '没有指定要撤回哪一条' };
+
+  // 目标必须是仍在当前表面上的节点。
+  const startIndex = nodes.findIndex((seq) => seq >= targetSeq);
+  if (startIndex < 0) return { ok: false, code: 'already-recalled', message: '该消息已被撤回' };
+
+  const startSeq = nodes[startIndex];
+  const endSeq = nodes[nodes.length - 1];
+  if (!Number.isSafeInteger(startSeq) || !Number.isSafeInteger(endSeq)) {
+    return { ok: false, code: 'bad-range', message: '撤回区间无效' };
+  }
+
+  const targetEvent = events.find((event) => Number(event?.seq) === startSeq);
+  const text = targetEvent && isHumanUserEvent(targetEvent) ? userTextOf(targetEvent) : '';
+
+  const shadowed = nodes.slice(startIndex);
+  const live = wrapDerive(session ?? service(ctx, 'sessions')?.get?.(sessionId));
+  if (!live || typeof live.append !== 'function') {
+    return { ok: false, code: 'no-live-session', message: '会话未激活，先打开该会话再撤回' };
+  }
+
+  await disarmInbox(ctx, sessionId);
+
+  const marker = live.append(
+    'user/message',
+    {
+      id: `${RECALL_PREFIX}${Date.now().toString(36)}-${shadowed.length}`,
+      role: 'user',
+      source: { kind: 'user' },
+      content: [],
+    },
+    { surfaceOp: { op: 'replace', startSeq, endSeq }, sourceEventSeqs: shadowed },
+  );
+
+  resetRequestSeries(ctx, sessionId);
+
+  return {
+    ok: true,
+    sessionId,
+    startSeq,
+    endSeq,
+    markerSeq: Number(marker?.seq ?? -1),
+    recalledCount: shadowed.length,
+    stopped,
+    text,
+    at: Date.now(),
+  };
+}
+
+/** 只读状态：当前会话有哪些可撤回的用户消息。 */
+async function status(ctx, payload) {
+  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  if (!sessionId) return { ok: false, code: 'no-session', message: '没有当前会话' };
+
+  const { events, session } = await readLog(ctx, sessionId);
+  const nodes = foldSurfaceNodes(events);
+  const onSurface = new Set(nodes);
+  const recallable = events
+    .filter((event) => onSurface.has(Number(event?.seq)))
+    .filter(isHumanUserEvent)
+    .map((event) => ({
+      seq: Number(event.seq),
+      messageId: event.data?.id ?? '',
+      text: userTextOf(event).slice(0, 160),
+    }));
+
+  return { ok: true, sessionId, surfaceNodes: nodes.length, recallable, live: Boolean(session) };
+}
+
+export const registerRecall = { recall, status, foldSurfaceNodes };
