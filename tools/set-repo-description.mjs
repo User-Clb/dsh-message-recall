@@ -10,8 +10,8 @@ if (!token) {
 }
 
 const description = 'DeepSeek Harness 消息撤回插件：每条你发出的消息气泡下方、复制按钮旁边都有撤回按钮。'
-  + '支持两种范围——仅撤回本条，或撤回本条及其之后的所有消息；'
-  + '被撤回的内容会真正退出会话与模型上下文，原文自动回填输入框。'
+  + '默认撤回这条消息及其引出的整轮回复，也可选择撤回这条及之后；'
+  + '被撤回的内容会真正退出会话视图与模型上下文，下一轮对话模型就不再知道它。'
   + 'Web 界面与桌面客户端共用同一份客户端包。';
 
 const response = await fetch('https://api.github.com/repos/User-Clb/dsh-message-recall', {
