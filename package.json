@@ -1,7 +1,7 @@
 {
   "name": "dsh-message-recall",
   "version": "0.1.0",
-  "description": "Message recall for DeepSeek Harness: a recall button on every user bubble that hides the message and everything after it, truncates the model context, and puts the original text back into the composer. Works in the Web GUI and the desktop client (one shared client bundle).",
+  "description": "DeepSeek Harness 消息撤回插件：每条你发出的消息气泡下方、复制按钮旁边都有撤回按钮。支持两种范围——仅撤回本条，或撤回本条及其之后的所有消息；被撤回的内容会真正退出会话与模型上下文，原文自动回填输入框。Web 界面与桌面客户端共用同一份客户端包。",
   "keywords": [
     "dsh",
     "dsh-plugin",

@@ -3,17 +3,21 @@
  *
  * 「真正撤回」的落点有两处，缺一不可：
  *
- * 1) 模型上下文：在会话日志尾部追加一条表面替换事件
- *    （surfaceOp: { op: 'replace', startSeq, endSeq }），
- *    与官方 compaction checkpoint 同一条通道。session.deriveMessages
+ * 1) 模型上下文 —— 在会话日志尾部追加一条表面替换事件：
+ *      append('user/message', {...}, {
+ *        surfaceOp: { op: 'replace', startSeq, endSeq },
+ *        sourceEventSeqs: [...shadowed],
+ *      })
+ *    这与官方 compaction checkpoint 走同一条通道。session.deriveMessages()
  *    立即从该点截断，下一轮请求不再包含被撤回的消息。
- *    替换事件自身通过 id 前缀 `recall-` 在派生时被过滤，不进上下文。
+ *    替换事件本身是 user/message，但 id 带 recall- 前缀，派生时被过滤，
+ *    因此不会以「用户说了一句空话」的形式进入上下文。
  *
- * 2) 会话记录：被遮蔽的事件仍留在追加式日志里（可审计、可恢复），
- *    但不再参与“当前表面”。客户端装配器按同一规则剔除它们，
- *    因此聊天视图里气泡真正消失，而不是只做视觉隐藏。
+ * 2) 会话记录视图 —— 被遮蔽的事件仍留在追加式日志里（可审计、可恢复），
+ *    但已不在「当前表面」上。客户端装配器按同一规则剔除，气泡真正消失。
  *
- * 另外清掉入站队列里尚未发出的消息，避免撤回后又被旧内容唤醒。
+ * 另外：撤回前先停掉仍在跑的回合，并清空入站队列里未发出的内容，
+ * 避免撤回后旧内容又被唤醒。
  */
 
 /** 从 ctx 取服务，缺省安全。 */
@@ -90,13 +94,14 @@ function userTextOf(event) {
     .join('');
 }
 
-function isRecallMarker(event) {
-  if (event?.type !== 'user/message') return false;
+/** 该事件是否是本插件写入的撤回标记。 */
+export function isRecallMarker(event) {
+  if (!event || event.type !== 'user/message') return false;
   const id = event?.data?.id;
   return typeof id === 'string' && id.startsWith(RECALL_PREFIX);
 }
 
-/** 一条事件是否是“人类用户发出的消息”。 */
+/** 一条事件是否是「人类用户发出的、有内容的」消息。 */
 function isHumanUserEvent(event) {
   if (event?.type !== 'user/message') return false;
   if (isRecallMarker(event)) return false;
@@ -106,7 +111,7 @@ function isHumanUserEvent(event) {
 }
 
 /**
- * 按表面替换规则折叠出“当前表面”的节点序列。
+ * 按表面替换规则折叠出「当前表面」的节点序列。
  *
  * @param events - 完整事件日志（按 seq 升序）。
  * @returns 当前表面事件的 seq 数组（升序）。
@@ -116,12 +121,11 @@ export function foldSurfaceNodes(events) {
   for (const event of events) {
     if (!SURFACE_TYPES.has(event?.type)) continue;
     const op = event.surfaceOp;
-    if (op === 'append' || op === undefined) {
+    if (op === undefined || op === 'append') {
       nodes.push(Number(event.seq));
       continue;
     }
-    if (typeof op !== 'object' || op === null) continue;
-    if (op.op !== 'replace') continue;
+    if (typeof op !== 'object' || op === null || op.op !== 'replace') continue;
     const start = Number(op.startSeq);
     const end = Number(op.endSeq);
     for (let index = nodes.length - 1; index >= 0; index -= 1) {
@@ -176,7 +180,7 @@ async function disarmInbox(ctx, sessionId) {
   }
 }
 
-/** 若该轮还在运行，先停掉，避免撤回后旧回合继续写回。 */
+/** 该回合仍在运行时先停掉，避免撤回后旧回合继续写回。 */
 async function stopRunningTurn(ctx, sessionId) {
   const agents = service(ctx, 'agents');
   const agent = agents?.get?.(sessionId);
@@ -191,11 +195,12 @@ async function stopRunningTurn(ctx, sessionId) {
 }
 
 /**
- * 撤回一条用户消息及其之后的所有内容。
+ * 撤回消息。
  *
  * @param ctx - Host 根上下文。
- * @param payload - `{ sessionId, seq?, messageId? }`。
- * @returns 撤回结果，含回填输入框所需的原文。
+ * @param payload - `{ sessionId, seq?, messageId?, scope? }`；
+ *   `scope` 取 `"only"`（仅撤回本条）或 `"from"`（本条及其之后，默认）。
+ * @returns 撤回结果；成功时含回填输入框所需的原文。
  */
 async function recall(ctx, payload) {
   const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
@@ -222,20 +227,48 @@ async function recall(ctx, payload) {
   if (targetSeq === undefined && wantedSeq !== undefined) targetSeq = wantedSeq;
   if (targetSeq === undefined) return { ok: false, code: 'target-missing', message: '没有指定要撤回哪一条' };
 
-  // 目标必须是仍在当前表面上的节点。
-  const startIndex = nodes.findIndex((seq) => seq >= targetSeq);
+  // 定位目标在表面上的位置。
+  let startIndex = nodes.findIndex((seq) => seq >= targetSeq);
   if (startIndex < 0) return { ok: false, code: 'already-recalled', message: '该消息已被撤回' };
 
-  const startSeq = nodes[startIndex];
-  const endSeq = nodes[nodes.length - 1];
-  if (!Number.isSafeInteger(startSeq) || !Number.isSafeInteger(endSeq)) {
+  // 系统提示永远不进入撤回区间。
+  while (startIndex < nodes.length) {
+    const event = events[Number(nodes[startIndex])];
+    if (event?.type !== 'system/message') break;
+    startIndex += 1;
+  }
+  if (startIndex >= nodes.length) {
+    return { ok: false, code: 'already-recalled', message: '该消息已被撤回' };
+  }
+
+  // 目标若已是撤回标记，说明这个位置之前就撤回过。
+  const candidate = events[Number(nodes[startIndex])];
+  if (isRecallMarker(candidate)) {
+    return { ok: false, code: 'already-recalled', message: '该消息已被撤回' };
+  }
+
+  // scope=only：只撤这一条；scope=from：本条及其之后（默认）。
+  const scope = payload?.scope === 'only' ? 'only' : 'from';
+
+  const startSeq = Number(nodes[startIndex]);
+  let endSeq;
+  if (scope === 'only') {
+    // 只撤这一条用户消息本身，后续内容保持不动。
+    endSeq = startSeq;
+  } else {
+    endSeq = Number(nodes[nodes.length - 1]);
+  }
+  if (!Number.isSafeInteger(startSeq) || !Number.isSafeInteger(endSeq) || endSeq < startSeq) {
     return { ok: false, code: 'bad-range', message: '撤回区间无效' };
   }
 
-  const targetEvent = events.find((event) => Number(event?.seq) === startSeq);
-  const text = targetEvent && isHumanUserEvent(targetEvent) ? userTextOf(targetEvent) : '';
+  const text = isHumanUserEvent(candidate) ? userTextOf(candidate) : '';
 
-  const shadowed = nodes.slice(startIndex);
+  const shadowed = nodes
+    .slice(startIndex)
+    .map((seq) => Number(seq))
+    .filter((seq) => Number.isSafeInteger(seq) && seq >= startSeq && seq <= endSeq);
+
   const live = wrapDerive(session ?? service(ctx, 'sessions')?.get?.(sessionId));
   if (!live || typeof live.append !== 'function') {
     return { ok: false, code: 'no-live-session', message: '会话未激活，先打开该会话再撤回' };
@@ -259,6 +292,7 @@ async function recall(ctx, payload) {
   return {
     ok: true,
     sessionId,
+    scope,
     startSeq,
     endSeq,
     markerSeq: Number(marker?.seq ?? -1),
@@ -289,4 +323,4 @@ async function status(ctx, payload) {
   return { ok: true, sessionId, surfaceNodes: nodes.length, recallable, live: Boolean(session) };
 }
 
-export const registerRecall = { recall, status, foldSurfaceNodes };
+export const registerRecall = { recall, status, foldSurfaceNodes, isRecallMarker };

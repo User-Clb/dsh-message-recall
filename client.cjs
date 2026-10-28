@@ -130,6 +130,9 @@ window.__ModuleLoader__.load({
 
     const zh = {
       recall: "撤回这条及之后的消息",
+      recallOnly: "仅撤回这条消息",
+      recallFrom: "撤回这条及之后的所有消息",
+      scopeTitle: "选择撤回范围",
       busy: "撤回中…",
       copy: "复制",
       copied: "已复制",
@@ -137,6 +140,9 @@ window.__ModuleLoader__.load({
     };
     const en = {
       recall: "Recall this and everything after",
+      recallOnly: "Recall only this message",
+      recallFrom: "Recall this and all later messages",
+      scopeTitle: "Choose recall scope",
       busy: "Recalling…",
       copy: "Copy",
       copied: "Copied",
@@ -178,6 +184,44 @@ window.__ModuleLoader__.load({
         opacity: 0.8,
         marginRight: "4px",
       },
+      recallWrap: {
+        position: "relative",
+        display: "inline-flex",
+        alignItems: "center",
+      },
+      menu: {
+        position: "absolute",
+        bottom: "calc(100% + 6px)",
+        right: "0",
+        minWidth: "210px",
+        padding: "4px",
+        borderRadius: "8px",
+        border: "1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.24))",
+        background: "var(--dsw-alias-bg-elevated, #1f1f1f)",
+        boxShadow: "0 6px 20px rgba(0,0,0,0.28)",
+        zIndex: 40,
+        display: "flex",
+        flexDirection: "column",
+        gap: "2px",
+      },
+      menuItem: {
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-start",
+        gap: "1px",
+        width: "100%",
+        padding: "7px 9px",
+        border: "0",
+        borderRadius: "6px",
+        background: "transparent",
+        color: "inherit",
+        cursor: "pointer",
+        textAlign: "left",
+        fontSize: "12px",
+        lineHeight: 1.35,
+      },
+      menuLabel: { fontSize: "12px" },
+      menuHint: { fontSize: "11px", opacity: 0.6 },
     };
 
     function CopyGlyph({ copied }) {
@@ -281,8 +325,8 @@ window.__ModuleLoader__.load({
       }
 
       /** 执行撤回：Host 截断表面，再把原文回填输入框。 */
-      async function recall(sessionId, seq, fallbackText, setDraft) {
-        const result = await callRpc(ctx, "recall", { sessionId, seq });
+      async function recall(sessionId, seq, fallbackText, setDraft, scope) {
+        const result = await callRpc(ctx, "recall", { sessionId, seq, scope });
         if (!result || result.ok !== true) throw new Error(result?.message ?? t("failed"));
         const text = typeof result.text === "string" && result.text !== "" ? result.text : (fallbackText ?? "");
         if (text && typeof setDraft === "function") setDraft(text);
@@ -304,6 +348,7 @@ window.__ModuleLoader__.load({
         const [copied, setCopied] = React.useState(false);
         const [phase, setPhase] = React.useState("idle");
         const [error, setError] = React.useState(null);
+        const [menuOpen, setMenuOpen] = React.useState(false);
 
         const copy = React.useCallback(
           (event) => {
@@ -318,10 +363,12 @@ window.__ModuleLoader__.load({
           [plain],
         );
 
+        /** 执行一次撤回，scope 为 only / from。 */
         const run = React.useCallback(
-          async (event) => {
-            event.preventDefault();
-            event.stopPropagation();
+          async (event, scope) => {
+            event?.preventDefault?.();
+            event?.stopPropagation?.();
+            setMenuOpen(false);
             if (phase === "busy") return;
             const sessionId = currentSessionId();
             if (!sessionId) {
@@ -331,7 +378,7 @@ window.__ModuleLoader__.load({
             setPhase("busy");
             setError(null);
             try {
-              await recall(sessionId, Number(data.seq), plain, setDraft);
+              await recall(sessionId, Number(data.seq), plain, setDraft, scope);
               setPhase("done");
             } catch (cause) {
               setPhase("idle");
@@ -341,9 +388,38 @@ window.__ModuleLoader__.load({
           [data.seq, phase, plain, setDraft, t],
         );
 
+        // 点外部收起菜单。
+        React.useEffect(() => {
+          if (!menuOpen) return undefined;
+          const close = () => setMenuOpen(false);
+          window.addEventListener("click", close, true);
+          window.addEventListener("keydown", close, true);
+          return () => {
+            window.removeEventListener("click", close, true);
+            window.removeEventListener("keydown", close, true);
+          };
+        }, [menuOpen]);
+
         const clock = clockOf(data.time);
         const copyLabel = copied ? (translate?.("copied") ?? t("copied")) : (translate?.("copy") ?? t("copy"));
         const recallLabel = phase === "busy" ? t("busy") : t("recall");
+
+        /** 撤回范围菜单项。 */
+        const menuItem = (scope, label, hint) =>
+          h(
+            "button",
+            {
+              type: "button",
+              role: "menuitem",
+              "data-dsh-recall-scope": scope,
+              onClick: (event) => run(event, scope),
+              style: styles.menuItem,
+              onMouseEnter: (e) => { e.currentTarget.style.background = "var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,0.16))"; },
+              onMouseLeave: (e) => { e.currentTarget.style.background = "transparent"; },
+            },
+            h("span", { style: styles.menuLabel }, label),
+            hint ? h("span", { style: styles.menuHint }, hint) : null,
+          );
 
         return h(
           "div",
@@ -362,19 +438,38 @@ window.__ModuleLoader__.load({
             phase === "done"
               ? null
               : h(
-                  "button",
-                  {
-                    type: "button",
-                    title: recallLabel,
-                    "aria-label": recallLabel,
-                    "data-dsh-recall-button": "",
-                    disabled: phase === "busy",
-                    onClick: run,
-                    style: styles.iconButton,
-                    onMouseEnter: (e) => { e.currentTarget.style.opacity = "1"; },
-                    onMouseLeave: (e) => { e.currentTarget.style.opacity = "0.55"; },
-                  },
-                  h(RecallGlyph, {}),
+                  "span",
+                  { style: styles.recallWrap },
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      title: recallLabel,
+                      "aria-label": recallLabel,
+                      "aria-haspopup": "menu",
+                      "aria-expanded": menuOpen ? "true" : "false",
+                      "data-dsh-recall-button": "",
+                      disabled: phase === "busy",
+                      onClick: (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (phase === "busy") return;
+                        setMenuOpen((open) => !open);
+                      },
+                      style: styles.iconButton,
+                      onMouseEnter: (e) => { e.currentTarget.style.opacity = "1"; },
+                      onMouseLeave: (e) => { e.currentTarget.style.opacity = "0.55"; },
+                    },
+                    h(RecallGlyph, {}),
+                  ),
+                  menuOpen
+                    ? h(
+                        "div",
+                        { role: "menu", "aria-label": t("scopeTitle"), style: styles.menu },
+                        menuItem("only", t("recallOnly"), ""),
+                        menuItem("from", t("recallFrom"), ""),
+                      )
+                    : null,
                 ),
             h(
               "button",
