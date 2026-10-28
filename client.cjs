@@ -17,34 +17,54 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
 
     const NAME = "dsh-message-recall";
-    const RPC_METHOD = "plugin-rpc/dsh-message-recall";
+    const ROUTE = "/dsh-message-recall";
     const NS = "message-recall";
 
     /* ================================================================ */
-    /* RPC                                                              */
+    /* 传输：同源 fetch（与宿主 webServer 注册的普通路由对应）            */
     /* ================================================================ */
 
-    function rpcOf(ctx) {
-      const connection = ctx?.get?.("connection", false) ?? ctx?.connection;
-      const rpc = connection?.rpc;
-      return rpc && typeof rpc.call === "function" ? rpc : null;
-    }
-
-    function signalOf(ms) {
-      return typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-        ? AbortSignal.timeout(ms)
-        : undefined;
-    }
-
-    async function callRpc(ctx, endpoint, payload, timeoutMs = 60000) {
-      const rpc = rpcOf(ctx);
-      if (!rpc) throw new Error("connection.rpc 不可用");
-      const response = await rpc.call("/api", RPC_METHOD, { endpoint, payload }, signalOf(timeoutMs));
-      if (!response || response.ok !== true) {
-        const error = response?.error;
-        throw new Error(`${String(error?.code ?? "unknown")} ${String(error?.message ?? "")}`.trim());
+    function routeUrl(action, params) {
+      const url = new URL(`${ROUTE}/${action}`, window.location.origin);
+      for (const [key, value] of Object.entries(params ?? {})) {
+        if (value !== undefined && value !== null && value !== "") {
+          url.searchParams.set(key, String(value));
+        }
       }
-      return response.value;
+      return url.toString();
+    }
+
+    async function callApi(action, params, timeoutMs = 60000) {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(routeUrl(action, params), {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(params ?? {}),
+          signal: controller.signal,
+        });
+        const text = await response.text();
+        let data;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          throw new Error(`HTTP ${response.status}: ${text.slice(0, 120)}`);
+        }
+        if (!data || typeof data !== "object") throw new Error(`HTTP ${response.status}: 空响应`);
+        return data;
+      } catch (error) {
+        if (error?.name === "AbortError") throw new Error("撤回请求超时");
+        const message = String(error?.message ?? error);
+        if (/failed to fetch|networkerror|load failed/i.test(message)) {
+          throw new Error("连不上撤回接口，确认 DSH 还在运行后刷新页面");
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(timer);
+      }
     }
 
     /* ================================================================ */
@@ -307,26 +327,69 @@ window.__ModuleLoader__.load({
     /* 插件                                                             */
     /* ================================================================ */
 
+    /**
+     * 错误边界：节点渲染一旦抛错就退回官方外观，绝不让整个客户端崩溃。
+     */
+    class RecallBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { failed: false };
+      }
+
+      static getDerivedStateFromError() {
+        return { failed: true };
+      }
+
+      componentDidCatch(error) {
+        try {
+          console.warn("[dsh-message-recall] node render failed:", error);
+        } catch {
+          /* ignore */
+        }
+      }
+
+      render() {
+        if (this.state.failed) return this.props.fallback ?? null;
+        return this.props.children ?? null;
+      }
+    }
+
     function apply(ctx) {
-      const t = (key) => (ctx.locale?.text?.(NS, key) ?? zh[key] ?? key);
+      // 官方 locale 只提供 register / bind；这里用 bind 得到命名空间的 t()。
+      const bound = typeof ctx.locale?.bind === "function" ? ctx.locale.bind(NS) : null;
+      const t = (key) => {
+        try {
+          if (typeof bound === "function") {
+            const value = bound(key);
+            if (typeof value === "string" && value !== key) return value;
+          }
+        } catch {
+          /* 回退到内置字典 */
+        }
+        return zh[key] ?? key;
+      };
 
       ctx.effect(() => ctx.locale?.register?.(NS, { zh, en }), "dsh-message-recall: dictionaries");
 
-      /** 当前会话 id：官方 UI Workspace 的持久化选择。 */
+      /** 当前会话 id：优先官方 UI Workspace 的持久化选择，其次从 DOM 兜底。 */
       function currentSessionId() {
         try {
           const workspace = ctx.get("uiWorkspace", false);
           const selected = workspace?.selection?.getSnapshot?.()?.sessionId;
           if (typeof selected === "string" && selected) return selected;
         } catch {
-          /* 忽略 */
+          /* 继续兜底 */
         }
+        // DOM 兜底：会话根节点通常带 data-session-id。
+        const marker = document.querySelector("[data-session-id]");
+        const fromDom = marker?.getAttribute("data-session-id");
+        if (fromDom) return fromDom;
         return "";
       }
 
       /** 执行撤回：Host 截断表面，再把原文回填输入框。 */
       async function recall(sessionId, seq, fallbackText, setDraft, scope) {
-        const result = await callRpc(ctx, "recall", { sessionId, seq, scope });
+        const result = await callApi("recall", { sessionId, seq, scope });
         if (!result || result.ok !== true) throw new Error(result?.message ?? t("failed"));
         const text = typeof result.text === "string" && result.text !== "" ? result.text : (fallbackText ?? "");
         if (text && typeof setDraft === "function") setDraft(text);
@@ -336,7 +399,7 @@ window.__ModuleLoader__.load({
       /* ---------- 用户消息节点（气泡 + 操作条） ---------- */
 
       function UserRecallNodeView(props) {
-        const { node, renderFactorySlot, loadImage, t: translate, inputActions } = props;
+        const { node, renderFactorySlot, loadImage, t: translate, inputActions, sessionId: injectedSessionId } = props;
         const data = node?.data ?? {};
         const content = React.useMemo(() => prepareContent(data), [data]);
         const plain = content.text;
@@ -370,22 +433,23 @@ window.__ModuleLoader__.load({
             event?.stopPropagation?.();
             setMenuOpen(false);
             if (phase === "busy") return;
-            const sessionId = currentSessionId();
+            const sessionId = injectedSessionId || currentSessionId();
             if (!sessionId) {
-              setError(t("failed"));
+              setError("取不到会话 id");
               return;
             }
             setPhase("busy");
             setError(null);
             try {
-              await recall(sessionId, Number(data.seq), plain, setDraft, scope);
+              const result = await recall(sessionId, Number(data.seq), plain, setDraft, scope);
               setPhase("done");
+              if (result?.recalledCount > 1) setError(`已撤回 ${result.recalledCount} 条`);
             } catch (cause) {
               setPhase("idle");
               setError(String(cause?.message ?? cause));
             }
           },
-          [data.seq, phase, plain, setDraft, t],
+          [data.seq, injectedSessionId, phase, plain, setDraft, t],
         );
 
         // 点外部收起菜单。
@@ -490,6 +554,27 @@ window.__ModuleLoader__.load({
 
       /* ---------- 注册 ---------- */
 
+      /**
+       * 兜底渲染：与官方外观一致的用户气泡（无撤回按钮）。
+       * 只在撤回组件抛错时使用，保证消息始终可见。
+       */
+      function UserRecallPlain(props) {
+        const { node, renderFactorySlot, loadImage } = props;
+        const data = node?.data ?? {};
+        let content;
+        try {
+          content = prepareContent(data);
+        } catch {
+          content = { text: "", attachments: [], extraBlocks: [], referenceLabels: [] };
+        }
+        return renderFactorySlot("conversation.chat.user.content", {
+          content,
+          loadImage,
+          facts: {},
+          interactive: true,
+        });
+      }
+
       ctx.slots.inject("conversation.chat.node", () => ctx.slots.register(
         {
           name: "conversation.chat.node",
@@ -497,8 +582,18 @@ window.__ModuleLoader__.load({
           // 比官方条目（默认 0）更低的 priority 优先渲染。
           priority: -1,
           locale: NS,
+          // 槽位注入：官方把当前会话 id 直接下发给 Session 作用域的条目。
+          inject: (sessionId) => ({ sessionId }),
         },
-        UserRecallNodeView,
+        function UserRecallNodeBoundary(props) {
+          return h(
+            RecallBoundary,
+            {
+              fallback: h(UserRecallPlain, props),
+            },
+            h(UserRecallNodeView, props),
+          );
+        },
       ));
 
       /* ---------- 装配器补丁：让被撤回的事件真正消失 ---------- */

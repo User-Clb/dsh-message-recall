@@ -195,6 +195,41 @@ async function stopRunningTurn(ctx, sessionId) {
 }
 
 /**
+ * 客户端拿不到会话 id 时的兜底：取最近活跃的活会话。
+ *
+ * @param ctx - Host 根上下文。
+ * @returns 会话 id，找不到返回空串。
+ */
+function fallbackSessionId(ctx) {
+  const sessions = service(ctx, 'sessions');
+  try {
+    const list = sessions?.list?.();
+    if (!Array.isArray(list) || list.length === 0) return '';
+    // 取最后创建且事件最多的活会话（最可能是用户正在看的那个）。
+    let best = '';
+    let bestScore = -1;
+    for (const session of list) {
+      const id = session?.id ?? session?.header?.id;
+      if (typeof id !== 'string' || !id) continue;
+      let score = 0;
+      try {
+        score = Number(session?.snapshotEvents?.()?.length ?? 0);
+      } catch {
+        score = 0;
+      }
+      if (score >= bestScore) {
+        bestScore = score;
+        best = id;
+      }
+    }
+    return best;
+  } catch {
+    /* 忽略 */
+  }
+  return '';
+}
+
+/**
  * 撤回消息。
  *
  * @param ctx - Host 根上下文。
@@ -203,7 +238,8 @@ async function stopRunningTurn(ctx, sessionId) {
  * @returns 撤回结果；成功时含回填输入框所需的原文。
  */
 async function recall(ctx, payload) {
-  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  let sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  if (!sessionId) sessionId = fallbackSessionId(ctx);
   if (!sessionId) return { ok: false, code: 'no-session', message: '没有当前会话' };
 
   const stopped = await stopRunningTurn(ctx, sessionId);

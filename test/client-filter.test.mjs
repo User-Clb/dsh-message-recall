@@ -27,6 +27,13 @@ function loadClientInternals() {
     useMemo: (fn) => fn(),
     useState: (initial) => [initial, () => {}],
     useCallback: (fn) => fn,
+    useEffect: () => {},
+    Component: class Component {
+      constructor(props) {
+        this.props = props;
+        this.state = {};
+      }
+    },
   };
 
   const captured = {};
