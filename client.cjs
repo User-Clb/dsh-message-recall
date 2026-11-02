@@ -1,14 +1,20 @@
-// dsh-message-recall 客户端半。
-//
-// 职责边界（刻意做到最小、最安全）：
-//   - 只在用户消息框的复制按钮旁插一个撤回按钮（原生 DOM，不覆盖官方槽位）；
-//   - 点击后调用宿主 /dsh-message-recall/recall，由宿主真删除（表面替换 + 派生缓存失效）；
-//   - 宿主成功后，让当前会话重新加载窗口，界面自然少掉那几条（不再用 CSS 假装隐藏）。
-//
-// 不碰装配器、不覆盖官方 React 树、不改其它插件，任何异常都只影响按钮自身。
 window.__ModuleLoader__.load({
   id: "dsh-message-recall",
-  factory: () => {
+  factory: (require) => {
+    /*
+     dsh-message-recall 客户端半。
+     
+     职责边界（刻意做到最小、最安全）：
+       - 只在用户消息框的复制按钮旁插一个撤回按钮（原生 DOM，不覆盖官方槽位）；
+       - 点击后调用宿主 /dsh-message-recall/recall，由宿主真删除（表面替换 + 派生缓存失效）；
+       - 宿主成功后，让当前会话重新加载窗口，界面自然少掉那几条（不再用 CSS 假装隐藏）。
+     
+     不碰装配器、不覆盖官方 React 树、不改其它插件，任何异常都只影响按钮自身。
+    */
+   try {
+    const React = require ? require("react") : null;
+    const h = React ? React.createElement : null;
+
     const NAME = "dsh-message-recall";
     const ROUTE = "/dsh-message-recall";
 
@@ -112,22 +118,76 @@ window.__ModuleLoader__.load({
      * @returns 是否触发了重建。
      */
     /**
-     * 撤回成功后让界面与数据一致。
+     * 撤回后让界面更新。
      *
-     * 官方没有公开的「重新拉取窗口」入口；replaceWindow 传入同样的条目
-     * 也不会剔除旧节点（它按条目自身内容过滤，旧条目还在就照旧渲染）。
-     * 因此这里直接刷新页面：保证用户看到的一定是撤回后的真实状态，
-     * 代价是一次重载，但绝不会出现「数据已删、界面还在」。
+     * 绝不刷新页面：那会打断用户、丢失滚动位置，看起来像「应用重启」。
+     * 这里只做局部更新——把被撤回的那几条从视图里移掉：
+     *   scope=only 移除点击的那一条（及其回复）；scope=from 移除到末尾。
      *
-     * @returns 总是 true（刷新是同步触发的）。
+     * @param fromBar - 被点击按钮所在的操作条。
+     * @param scope - "only" 或 "from"。
      */
-    function reloadSession() {
+    /**
+     * 撤回后立即更新界面（不刷新页面）。
+     *
+     * 语义与宿主严格一致：只处理「这条及其之后」，绝不碰更早的消息。
+     * 做法：拿到页面上所有消息行（按视觉顺序），从被点击那条开始向后隐藏。
+     * 只隐藏「单条消息」容器，避免误伤整个会话。
+     *
+     * @param fromBar - 被点击按钮所在的操作条。
+     * @param scope - "only" 只隐藏这一条（及其回复）；"from" 隐藏到末尾。
+     */
+    function updateView(fromBar, scope) {
       try {
-        window.location.reload();
+        const all = collectMessageRows();
+        const at = all.findIndex((entry) => entry.bar && (entry.bar === fromBar || entry.bar.contains(fromBar)));
+        if (at < 0) return;
+
+        let targets;
+        if (scope === 'from') {
+          targets = all.slice(at);
+        } else {
+          // only：本条 + 紧随其后的回复，遇到下一条用户消息就停。
+          targets = [];
+          for (let index = at; index < all.length; index += 1) {
+            const entry = all[index];
+            if (index > at && entry.isUser) break;
+            targets.push(entry);
+          }
+        }
+
+        for (const { node } of targets) {
+          if (!node) continue;
+          node.style.display = "none";
+          node.setAttribute("data-dsh-recall-hidden", "1");
+        }
       } catch {
-        /* 忽略 */
+        /* 界面更新失败也不刷新页面 */
       }
-      return true;
+    }
+
+    /**
+     * 收集页面上所有消息行（用户与助手都算），按视觉顺序。
+     *
+     * @returns `{ node, isUser, bar }` 数组。
+     */
+    function collectMessageRows() {
+      const nodes = [...document.querySelectorAll("[data-chat-flow-key]")];
+      const out = [];
+      for (const node of nodes) {
+        if (!(node instanceof HTMLElement)) continue;
+        // 只取「单条消息」容器：内部不再嵌套其它消息行。
+        if (node.querySelector("[data-chat-flow-key]")) continue;
+
+        let bar = null;
+        let isUser = false;
+        for (const button of node.querySelectorAll("button")) {
+          const label = (button.getAttribute("aria-label") ?? button.getAttribute("title") ?? "").trim();
+          if (/复制|copy/i.test(label)) { bar = button.parentElement; isUser = true; break; }
+        }
+        out.push({ node, isUser, bar });
+      }
+      return out;
     }
 
     /* ================================================================ */
@@ -154,21 +214,39 @@ window.__ModuleLoader__.load({
      * @param fromNode - 可选：从这个元素向上找（点按钮时传按钮自己）。
      * @returns 会话 id，取不到返回空串。
      */
-    function currentSessionId(ctx, fromNode) {
-      // 1) 从触发元素向上找会话根（最精确）。
-      try {
-        const anchor = fromNode instanceof Element
-          ? fromNode.closest("[data-conversation-session]")
-          : document.querySelector("[data-conversation-session]");
-        const fromDom = anchor?.getAttribute("data-conversation-session");
-        if (typeof fromDom === "string" && fromDom) return fromDom;
-      } catch { /* 继续 */ }
-
-      // 2) 官方 UI Workspace 的选择。
+    /**
+     * 取当前**可见**会话的 id。
+     *
+     * 页面里可能同时挂着多个会话容器（缓存的旧会话也在 DOM 里），
+     * 所以不能随便取第一个——必须取「可见且有尺寸」的那个，
+     * 否则撤回会作用到别的会话，表现为「没找到要撤回的消息」。
+     *
+     * @param ctx - 插件上下文。
+     * @param fromNode - 可选：从触发元素向上找。
+     * @returns 会话 id，取不到返回空串。
+     */
+    /**
+     * 取当前会话 id。
+     *
+     * 唯一权威来源：官方 uiWorkspace 的当前选中会话。
+     * 不用 DOM 的 data-conversation-session——实测它会残留旧值
+     * （容器上写着 A，实际显示的却是 B 的内容），据此撤回必然定位错。
+     *
+     * @param ctx - 插件上下文。
+     * @returns 会话 id，取不到返回空串。
+     */
+    function currentSessionId(ctx) {
       try {
         const workspace = ctx?.get?.("uiWorkspace", false);
         const selected = workspace?.selection?.getSnapshot?.()?.sessionId;
         if (typeof selected === "string" && selected) return selected;
+      } catch { /* 继续 */ }
+
+      // 次选：官方 sessions 的当前会话（与 workspace 同源）。
+      try {
+        const sessions = ctx?.get?.("sessions", false);
+        const current = sessions?.current?.()?.id ?? sessions?.activeSessionId;
+        if (typeof current === "string" && current) return current;
       } catch { /* 继续 */ }
 
       return "";
@@ -271,26 +349,45 @@ window.__ModuleLoader__.load({
      * @param row - 消息行元素。
      * @returns 消息 id，取不到返回空串。
      */
+    /**
+     * 从消息行的 DOM 上取官方消息 id（全局唯一）。
+     *
+     * data-chat-node-key 的格式在不同版本里可能是：
+     *   - JSON 数组：["node","<key>",null]
+     *   - 裸字符串：<key>
+     * 而 <key> 本身又可能是 "input-message<id>" 或直接 <id>。
+     * 这里逐层剥开，拿到最里层的 id。
+     *
+     * @param row - 消息行元素。
+     * @returns 消息 id，取不到返回空串。
+     */
     function messageIdOf(row) {
-      const node = row.closest("[data-chat-node-key]") ?? row.querySelector("[data-chat-node-key]");
-      const raw = node?.getAttribute("data-chat-node-key") ?? "";
+      const node = row?.closest?.("[data-chat-node-key]") ?? row?.querySelector?.("[data-chat-node-key]");
+      let raw = node?.getAttribute?.("data-chat-node-key") ?? "";
       if (!raw) return "";
-      // key 可能是 JSON 数组，也可能就是裸 id。
-      try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          for (const part of parsed) {
-            if (typeof part !== "string") continue;
-            const match = part.match(/^input-message(.+)$/);
-            if (match) return match[1];
+
+      // 剥 JSON 数组
+      if (raw.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            // 取数组里第一个非固定前缀的字符串
+            for (const part of parsed) {
+              if (typeof part !== "string" || !part) continue;
+              if (part === "node" || part === "group") continue;
+              raw = part;
+              break;
+            }
           }
-          return "";
-        }
-      } catch {
-        /* 不是 JSON，按裸值处理 */
+        } catch { /* 保持原值 */ }
       }
-      const match = raw.match(/^input-message(.+)$/);
-      return match ? match[1] : "";
+
+      // 去掉 input-message / steering 等前缀
+      const m = raw.match(/^(?:input-message|steering|context|assistant-step|turn-trigger)-?(.+)$/);
+      if (m) return m[1];
+
+      // 已是裸 id
+      return raw;
     }
 
     /**
@@ -332,7 +429,7 @@ window.__ModuleLoader__.load({
         button.disabled = true;
         button.style.opacity = "0.45";
         try {
-          const sessionId = currentSessionId(ctx, bubble);
+          const sessionId = currentSessionId(ctx);
           if (!sessionId) throw new Error("取不到当前会话");
           const result = await callApi("recall", {
             sessionId,
@@ -425,15 +522,13 @@ window.__ModuleLoader__.load({
         button.title = labels.busy;
         notice.textContent = "";
         try {
-          const sessionId = currentSessionId(ctx, host);
+          const sessionId = currentSessionId(ctx);
           if (!sessionId) throw new Error("取不到当前会话");
           // 优先用 messageId 精确撤回；只有拿不到 id 时才退回按文本。
-          const payload = { sessionId, scope };
-          if (target.messageId) payload.messageId = target.messageId;
-          else payload.text = target.text;
+          const payload = { sessionId, scope, index: target.index };
           const result = await callApi("recall", payload);
           if (!result?.ok) throw new Error(result?.message ?? labels.failed);
-          await onRecalled?.(result);
+          await onRecalled?.(result, scope);
         } catch (error) {
           notice.textContent = String(error?.message ?? error);
         } finally {
@@ -468,51 +563,61 @@ window.__ModuleLoader__.load({
     /* 扫描挂载                                                         */
     /* ================================================================ */
 
-    function sweep(ctx) {
-      let added = 0;
-
-      // 不依赖 data-chat-flow-kind（不同版本取值不一致：user / input-message /
-      // steering 都出现过）。改从「官方操作条」反查：用户消息的操作条里有
-      // 复制按钮，这是稳定特征。
+    /**
+     * 收集页面上所有用户消息行，按视觉顺序返回。
+     *
+     * 不依赖 data-chat-node-key / flow-kind 的具体取值（各版本不一致），
+     * 只用「有复制按钮的操作条」这一稳定特征。
+     *
+     * @returns 用户消息行数组，按页面从上到下排列。
+     */
+    function collectUserRows() {
+      const rows = [];
       for (const bar of document.querySelectorAll("[class*='_actions']")) {
         if (!(bar instanceof HTMLElement)) continue;
-        if (bar.querySelector(`[${MOUNT}]`)) continue;
-
-        // 必须是含复制按钮的那条操作条。
         let hasCopy = false;
         for (const button of bar.querySelectorAll("button")) {
           const label = (button.getAttribute("aria-label") ?? button.getAttribute("title") ?? "").trim();
           if (/复制|copy/i.test(label)) { hasCopy = true; break; }
         }
         if (!hasCopy) continue;
+        const row = bar.closest("[data-chat-flow-key]") ?? bar.parentElement;
+        if (!row || rows.includes(row)) continue;
+        rows.push({ row, bar });
+      }
+      // 按文档顺序排序（querySelectorAll 已保证，但兜底一次）。
+      rows.sort((a, b) => {
+        const pos = a.row.compareDocumentPosition(b.row);
+        return pos & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+      });
+      return rows;
+    }
 
-        // 向上找到承载这条消息的容器。
-        const row = bar.closest("[data-chat-node-key]") ?? bar.closest("[data-chat-flow-key]") ?? bar.parentElement;
-        if (!row) continue;
+    function sweep(ctx) {
+      let added = 0;
+      const rows = collectUserRows();
 
-        const messageId = messageIdOf(row);
+      rows.forEach((entry, index) => {
+        const { row, bar } = entry;
+        if (bar.querySelector(`[${MOUNT}]`)) return;
+
         const text = bubbleTextOf(row, bar);
-        if (!messageId && !text) continue;
-
-        bar.appendChild(buildButton({ messageId, text }, ctx, async (result) => {
-          reloadSession();
+        // index 是「页面上第几条用户消息」，宿主按同一顺序取，最可靠。
+        bar.appendChild(buildButton({ index, text }, ctx, (result, scope) => {
+          updateView(bar, scope || "only");
         }));
         added += 1;
-      }
+      });
 
-      // 排队中的消息（插话 / steering，尚未发出）也要能撤回。
-      // 它们带 data-pending-steering 标记，且不在会话日志里。
+      // 排队中的消息
       for (const bubble of document.querySelectorAll("[data-pending-steering]")) {
         if (!(bubble instanceof HTMLElement)) continue;
         if (bubble.querySelector(`[${MOUNT}]`)) continue;
-
         const host = document.createElement("span");
         host.setAttribute(MOUNT, "");
         host.style.cssText = "display:inline-flex;align-items:center;margin-left:6px;";
         bubble.appendChild(host);
-
-        const text = (bubble.textContent ?? "").trim();
-        host.appendChild(buildPendingButton(text, ctx, bubble));
+        host.appendChild(buildPendingButton((bubble.textContent ?? "").trim(), ctx, bubble));
         added += 1;
       }
 
@@ -529,10 +634,127 @@ window.__ModuleLoader__.load({
         return () => {};
       }, "dsh-message-recall: dictionaries");
 
+      // 助手回复的独立撤回按钮：走官方 assistant-actions 槽位（官方扩展点）。
+      // 每条助手消息都有自己的撤回按钮，与用户消息功能一致。
+      ctx.slots?.inject?.("conversation.chat.assistant-actions", () => {
+        try {
+          return ctx.slots.register(
+            {
+              name: "conversation.chat.assistant-actions",
+              id: "dsh-message-recall-assistant",
+              order: 10,
+              inject: (sessionId) => ({ sessionId }),
+            },
+            (props) => {
+              const messageId = props?.messageId;
+              const labels = dict();
+
+              // 用 React 渲染按钮，符合槽位契约。
+              return h("button", {
+                type: "button",
+                "data-dsh-recall-assistant": "",
+                title: labels.recall,
+                "aria-label": labels.recall,
+                style: {
+                  display: "inline-flex", alignItems: "center", justifyContent: "center",
+                  width: "20px", height: "20px", padding: "0", border: "0",
+                  borderRadius: "5px", background: "transparent", color: "inherit",
+                  opacity: 0.7, cursor: "pointer", lineHeight: 1,
+                },
+                onClick: async (event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  try {
+                    const r = await callApi("recall", { sessionId: props?.sessionId, messageId, scope: "only" });
+                    if (!r?.ok) throw new Error(r?.message ?? labels.failed);
+                  } catch (e) {
+                    event.currentTarget.title = String(e?.message ?? e);
+                  }
+                },
+                dangerouslySetInnerHTML: { __html: iconSvg() },
+              });
+            },
+          );
+        } catch {
+          return () => {};
+        }
+      });
+
       let observer = null;
       let timer = null;
 
       ctx.effect(() => {
+        // 启动自愈：清掉上一次可能残留的隐藏状态。
+        // 若曾因 bug 隐藏了整屏，这一步会把它们全部恢复。
+        try {
+          for (const node of document.querySelectorAll("[data-dsh-recall-hidden]")) {
+            node.style.display = "";
+            node.removeAttribute("data-dsh-recall-hidden");
+          }
+        } catch { /* 忽略 */ }
+
+        // 实测上报：把页面真实 DOM 状态发给宿主，用于诊断（不改任何显示）。
+        try {
+          const report = () => {
+            try {
+              const flows = document.querySelectorAll("[data-chat-flow-key]").length;
+              const hidden = document.querySelectorAll("[data-dsh-recall-hidden]").length;
+              const visible = [...document.querySelectorAll("[data-chat-flow-key]")]
+                .filter((n) => getComputedStyle(n).display !== "none").length;
+              // 上报所有会话容器，区分哪个是可见的
+              const roots = [...document.querySelectorAll("[data-conversation-session]")].map((n) => {
+                const cs = getComputedStyle(n);
+                const r = n.getBoundingClientRect();
+                const flows = n.querySelectorAll("[data-chat-flow-key]").length;
+                return {
+                  id: n.getAttribute("data-conversation-session") || "(empty)",
+                  display: cs.display,
+                  visibility: cs.visibility,
+                  w: Math.round(r.width),
+                  h: Math.round(r.height),
+                  flows,
+                };
+              });
+              const root = document.querySelector("[data-conversation-session]");
+              fetch("/dsh-message-recall/dom-report", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  session: root?.getAttribute("data-conversation-session") ?? "",
+                  roots,
+                  picked: (() => { try { return currentSessionId(ctx); } catch { return 'ERR'; } })(),
+                  sampleIds: [...document.querySelectorAll("[class*='_actions']")].slice(0, 6).map((bar) => {
+                    const row = bar.closest("[data-chat-flow-key]") ?? bar.parentElement;
+                    const node = row?.closest("[data-chat-node-key]") ?? row?.querySelector("[data-chat-node-key]");
+                    return {
+                      raw: (node?.getAttribute("data-chat-node-key") ?? "").slice(0, 50),
+                      id: (() => { try { return messageIdOf(row); } catch { return "ERR"; } })().slice(0, 40),
+                    };
+                  }),
+                  containers: [...document.querySelectorAll("[data-conversation-session]")].map((n) => {
+                    const r = n.getBoundingClientRect();
+                    return { id: (n.getAttribute("data-conversation-session") || "").slice(0, 26), h: Math.round(r.height), w: Math.round(r.width) };
+                  }),
+                  scrolls: [...document.querySelectorAll("[data-conversation-scroll]")].map((n) => {
+                    const r = n.getBoundingClientRect();
+                    return { h: Math.round(r.height), scrollH: n.scrollHeight, flows: n.querySelectorAll("[data-chat-flow-key]").length };
+                  }),
+                  inlineHidden: [...document.querySelectorAll("[style*='display: none']")].slice(0, 8).map((n) => ({
+                    tag: n.tagName,
+                    flow: n.getAttribute("data-chat-flow-key") ?? null,
+                    sess: n.getAttribute("data-conversation-session") ?? null,
+                  })),
+                  flows, hidden, visible,
+                  hiddenIds: [...document.querySelectorAll("[data-dsh-recall-hidden]")]
+                    .slice(0, 5).map((n) => n.getAttribute("data-chat-flow-key")),
+                }),
+              }).catch(() => {});
+            } catch { /* ignore */ }
+          };
+          window.setTimeout(report, 1500);
+          window.setTimeout(report, 4000);
+        } catch { /* ignore */ }
+
         const schedule = () => {
           if (timer !== null) return;
           timer = window.setTimeout(() => {
@@ -563,5 +785,12 @@ window.__ModuleLoader__.load({
       apply,
       __test: { dict, bubbleTextOf },
     };
+   } catch (error) {
+     try {
+       window.__DSH_RECALL_ERROR__ = String(error && error.stack || error);
+       console.error("[dsh-message-recall] factory failed:", error);
+     } catch { /* ignore */ }
+     throw error;
+   }
   },
 });
