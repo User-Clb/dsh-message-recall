@@ -19,6 +19,7 @@ window.__ModuleLoader__.load({
     const TEXT = {
       zh: {
         recall: "撤回",
+        recallPending: "撤回这条排队中的消息",
         only: "仅撤回这条消息",
         from: "撤回这条及之后的所有消息",
         fromWarn: "撤回这条及之后的所有消息（不可恢复）",
@@ -28,6 +29,7 @@ window.__ModuleLoader__.load({
       },
       en: {
         recall: "Recall",
+        recallPending: "Recall this queued message",
         only: "Recall only this message",
         from: "Recall this and all later messages",
         fromWarn: "Recall this and all later messages (cannot be undone)",
@@ -311,6 +313,67 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 造一个「撤回排队消息」按钮。
+     *
+     * 排队消息还没写进会话日志，撤回就是把它从发送队列里移除，
+     * 不需要表面替换，所以单独走 pending 通道。
+     *
+     * @param messageText - 气泡文本（用于在队列里匹配）。
+     * @param ctx - 插件上下文。
+     * @param bubble - 排队气泡元素（撤回后移除自己）。
+     * @returns 按钮宿主元素。
+     */
+    function buildPendingButton(messageText, ctx, bubble) {
+      const labels = dict();
+
+      const host = document.createElement("span");
+      host.setAttribute(MOUNT, "");
+      host.style.cssText = "display:inline-flex;align-items:center;";
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("data-dsh-recall-pending", "");
+      button.title = labels.recallPending;
+      button.setAttribute("aria-label", labels.recallPending);
+      button.style.cssText = "display:inline-flex;align-items:center;justify-content:center;"
+        + "width:20px;height:20px;padding:0;border:0;border-radius:5px;background:transparent;"
+        + "color:inherit;opacity:.7;cursor:pointer;line-height:1;";
+      button.innerHTML = iconSvg();
+      button.addEventListener("mouseenter", () => { button.style.opacity = "1"; });
+      button.addEventListener("mouseleave", () => { button.style.opacity = "0.7"; });
+
+      let busy = false;
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (busy) return;
+        busy = true;
+        button.disabled = true;
+        button.style.opacity = "0.45";
+        try {
+          const sessionId = currentSessionId(ctx);
+          if (!sessionId) throw new Error("取不到当前会话");
+          const result = await callApi("recall", {
+            sessionId,
+            pending: true,
+            text: messageText,
+          });
+          if (!result?.ok) throw new Error(result?.message ?? labels.failed);
+          bubble.remove();
+        } catch (error) {
+          button.title = String(error?.message ?? error);
+        } finally {
+          busy = false;
+          button.disabled = false;
+          button.style.opacity = "0.7";
+        }
+      });
+
+      host.appendChild(button);
+      return host;
+    }
+
+    /**
      * 造一个撤回按钮。
      *
      * @param target - `{ messageId, text }`，优先用 messageId 精确定位。
@@ -427,33 +490,51 @@ window.__ModuleLoader__.load({
     function sweep(ctx) {
       let added = 0;
 
-      // 用户消息的官方 kind 是 input-message（不是 user）。
-      // steering / context 同样来自用户，一并覆盖；
-      // 再用 data-chat-node-key 兜底，避免 kind 改名后整体失效。
-      const selector = [
-        "[data-chat-flow-kind='input-message']",
-        "[data-chat-flow-kind='steering']",
-        "[data-chat-flow-kind='context']",
-      ].join(",");
+      // 不依赖 data-chat-flow-kind（不同版本取值不一致：user / input-message /
+      // steering 都出现过）。改从「官方操作条」反查：用户消息的操作条里有
+      // 复制按钮，这是稳定特征。
+      for (const bar of document.querySelectorAll("[class*='_actions']")) {
+        if (!(bar instanceof HTMLElement)) continue;
+        if (bar.querySelector(`[${MOUNT}]`)) continue;
 
-      for (const row of document.querySelectorAll(selector)) {
-        if (!(row instanceof HTMLElement)) continue;
-        if (row.querySelector(`[${MOUNT}]`)) continue;
+        // 必须是含复制按钮的那条操作条。
+        let hasCopy = false;
+        for (const button of bar.querySelectorAll("button")) {
+          const label = (button.getAttribute("aria-label") ?? button.getAttribute("title") ?? "").trim();
+          if (/复制|copy/i.test(label)) { hasCopy = true; break; }
+        }
+        if (!hasCopy) continue;
 
-        // messageId 是主键：有它就能精确撤回，不依赖文本。
+        // 向上找到承载这条消息的容器。
+        const row = bar.closest("[data-chat-node-key]") ?? bar.closest("[data-chat-flow-key]") ?? bar.parentElement;
+        if (!row) continue;
+
         const messageId = messageIdOf(row);
-        const bar = findActionRow(row);
-        if (!bar) continue;
-
         const text = bubbleTextOf(row, bar);
         if (!messageId && !text) continue;
 
         bar.appendChild(buildButton({ messageId, text }, ctx, async (result) => {
-          // 宿主已经真删除了；这里让会话窗口按新表面重建。
           await reloadSession(result.sessionId, ctx);
         }));
         added += 1;
       }
+
+      // 排队中的消息（插话 / steering，尚未发出）也要能撤回。
+      // 它们带 data-pending-steering 标记，且不在会话日志里。
+      for (const bubble of document.querySelectorAll("[data-pending-steering]")) {
+        if (!(bubble instanceof HTMLElement)) continue;
+        if (bubble.querySelector(`[${MOUNT}]`)) continue;
+
+        const host = document.createElement("span");
+        host.setAttribute(MOUNT, "");
+        host.style.cssText = "display:inline-flex;align-items:center;margin-left:6px;";
+        bubble.appendChild(host);
+
+        const text = (bubble.textContent ?? "").trim();
+        host.appendChild(buildPendingButton(text, ctx, bubble));
+        added += 1;
+      }
+
       return added;
     }
 

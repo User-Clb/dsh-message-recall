@@ -194,6 +194,68 @@ function deriveStillContains(session, text) {
   });
 }
 
+/**
+ * 列出仍在排队、尚未发出的消息（插话/steering 队列）。
+ *
+ * @param ctx - Host 根上下文。
+ * @param sessionId - 会话 id。
+ * @returns 队列条目数组。
+ */
+function pendingMessages(ctx, sessionId) {
+  const agents = service(ctx, 'agents');
+  const agent = agents?.get?.(sessionId);
+  const out = [];
+  try {
+    for (const [slot, list] of [['nextTurn', agent?.inbox?.nextTurn], ['nextStep', agent?.inbox?.nextStep]]) {
+      for (const message of list ?? []) {
+        if (!message?.id) continue;
+        const content = message.content;
+        const text = typeof content === 'string'
+          ? content
+          : (Array.isArray(content) ? content.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('') : '');
+        out.push({ id: String(message.id), slot, text: text.slice(0, 200) });
+      }
+    }
+  } catch { /* ignore */ }
+  return out;
+}
+
+/**
+ * 撤回一条排队中的消息（还没发给模型，直接从队列移除即可）。
+ *
+ * @param ctx - Host 根上下文。
+ * @param sessionId - 会话 id。
+ * @param messageId - 队列条目 id。
+ * @returns 撤回结果。
+ */
+async function recallPending(ctx, sessionId, messageId, text) {
+  const queue = pendingMessages(ctx, sessionId);
+  const norm = (v) => String(v ?? '').replace(/s+/g, ' ').trim();
+  const wanted = norm(text);
+
+  const target = queue.find((row) => row.id === messageId)
+    ?? (wanted
+      ? queue.find((row) => norm(row.text) === wanted)
+        ?? queue.find((row) => norm(row.text).includes(wanted) || wanted.includes(norm(row.text)))
+      : undefined);
+
+  if (!target) {
+    return { ok: false, code: 'not-pending', message: '这条消息已经不在队列里了' };
+  }
+  const controller = service(ctx, 'sessionController');
+  try {
+    await controller?.updateQueue?.({ sessionId, itemId: target.id, action: { kind: 'remove' } });
+  } catch (error) {
+    return { ok: false, code: 'queue-remove-failed', message: String(error?.message ?? error) };
+  }
+  // 复核：真的不在队列里了。
+  const left = pendingMessages(ctx, sessionId);
+  if (left.some((row) => row.id === target.id)) {
+    return { ok: false, code: 'queue-not-cleared', message: '队列移除未生效' };
+  }
+  return { ok: true, sessionId, pending: true, messageId: target.id, text: target.text, at: Date.now() };
+}
+
 /** 让下一次请求重新组装。 */
 function resetRequestSeries(ctx, sessionId) {
   const agents = service(ctx, 'agents');
@@ -307,6 +369,15 @@ function matchByText(events, text) {
  * @returns 撤回结果；成功时含回填输入框所需的原文。
  */
 async function recall(ctx, payload) {
+  // 排队中的消息还没进日志，直接从队列移除即可（不需要表面替换）。
+  if (payload?.pending === true) {
+    const sid = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+    const mid = typeof payload?.messageId === 'string' ? payload.messageId : '';
+    const txt = typeof payload?.text === 'string' ? payload.text : '';
+    if (!sid || (!mid && !txt)) return { ok: false, code: 'no-session', message: '没有指定会话或消息' };
+    return recallPending(ctx, sid, mid, txt);
+  }
+
   const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
   // 必须明确指定会话：跨会话按文本猜会命中别的会话里同文本的消息
   // （表现为「该消息已被撤回」但当前气泡还在），所以这里不再兜底猜测。
@@ -579,6 +650,7 @@ async function status(ctx, payload) {
     surfaceNodes: nodes.length,
     totalEvents: events.length,
     recallable,
+    pending: pendingMessages(ctx, sessionId),
     live: Boolean(session),
   };
 }
