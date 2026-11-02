@@ -111,39 +111,23 @@ window.__ModuleLoader__.load({
      * @param ctx - 插件上下文。
      * @returns 是否触发了重建。
      */
-    async function reloadSession(sessionId, ctx) {
-      if (!sessionId) return false;
-
-      const conversation = (() => {
-        try { return ctx?.get?.("uiConversation", false); } catch { return undefined; }
-      })();
-
-      // 用装配器当前窗口重新装配一次：它内部会按 rewind- 标记剔除。
+    /**
+     * 撤回成功后让界面与数据一致。
+     *
+     * 官方没有公开的「重新拉取窗口」入口；replaceWindow 传入同样的条目
+     * 也不会剔除旧节点（它按条目自身内容过滤，旧条目还在就照旧渲染）。
+     * 因此这里直接刷新页面：保证用户看到的一定是撤回后的真实状态，
+     * 代价是一次重载，但绝不会出现「数据已删、界面还在」。
+     *
+     * @returns 总是 true（刷新是同步触发的）。
+     */
+    function reloadSession() {
       try {
-        const binding = conversation?.binding?.(sessionId);
-        const assembler = binding?.assembler;
-        if (assembler && typeof assembler.replaceWindow === "function") {
-          const inputs = assembler.inputs;
-          if (inputs instanceof Map && inputs.size > 0) {
-            assembler.replaceWindow([...inputs.values()], assembler.hasMore === true);
-            return true;
-          }
-        }
-      } catch {
-        /* 继续兜底 */
-      }
-
-      // 兜底：重新打开会话（官方 openSession = replaceMain(..., "reveal")）。
-      try {
-        const workspace = ctx?.get?.("uiWorkspace", false);
-        if (workspace && typeof workspace.openSession === "function") {
-          workspace.openSession(sessionId);
-          return true;
-        }
+        window.location.reload();
       } catch {
         /* 忽略 */
       }
-      return false;
+      return true;
     }
 
     /* ================================================================ */
@@ -159,38 +143,35 @@ window.__ModuleLoader__.load({
      * @param ctx - 插件上下文。
      * @returns 会话 id，取不到返回空串。
      */
-    function currentSessionId(ctx) {
+    /**
+     * 取当前会话 id。
+     *
+     * 优先从 DOM 精确取：官方在会话根节点上写了 data-conversation-session，
+     * 值就是 sessionId。这比「取事件最多的会话」可靠——多会话并存时，
+     * 后者会取错，表现就是「没找到要撤回的消息」。
+     *
+     * @param ctx - 插件上下文。
+     * @param fromNode - 可选：从这个元素向上找（点按钮时传按钮自己）。
+     * @returns 会话 id，取不到返回空串。
+     */
+    function currentSessionId(ctx, fromNode) {
+      // 1) 从触发元素向上找会话根（最精确）。
+      try {
+        const anchor = fromNode instanceof Element
+          ? fromNode.closest("[data-conversation-session]")
+          : document.querySelector("[data-conversation-session]");
+        const fromDom = anchor?.getAttribute("data-conversation-session");
+        if (typeof fromDom === "string" && fromDom) return fromDom;
+      } catch { /* 继续 */ }
+
+      // 2) 官方 UI Workspace 的选择。
       try {
         const workspace = ctx?.get?.("uiWorkspace", false);
         const selected = workspace?.selection?.getSnapshot?.()?.sessionId;
         if (typeof selected === "string" && selected) return selected;
-      } catch {
-        /* 继续兜底 */
-      }
-      try {
-        const sessions = ctx?.get?.("sessions", false);
-        const list = sessions?.list?.() ?? [];
-        // 兜底：取事件最多的活会话。
-        let best = "";
-        let bestCount = -1;
-        for (const row of list) {
-          const id = row?.id ?? row?.header?.id;
-          if (typeof id !== "string" || !id) continue;
-          let count = 0;
-          try {
-            count = Number(row?.snapshotEvents?.()?.length ?? 0);
-          } catch {
-            count = 0;
-          }
-          if (count >= bestCount) {
-            bestCount = count;
-            best = id;
-          }
-        }
-        return best;
-      } catch {
-        return "";
-      }
+      } catch { /* 继续 */ }
+
+      return "";
     }
 
     /* ================================================================ */
@@ -351,7 +332,7 @@ window.__ModuleLoader__.load({
         button.disabled = true;
         button.style.opacity = "0.45";
         try {
-          const sessionId = currentSessionId(ctx);
+          const sessionId = currentSessionId(ctx, bubble);
           if (!sessionId) throw new Error("取不到当前会话");
           const result = await callApi("recall", {
             sessionId,
@@ -444,7 +425,7 @@ window.__ModuleLoader__.load({
         button.title = labels.busy;
         notice.textContent = "";
         try {
-          const sessionId = currentSessionId(ctx);
+          const sessionId = currentSessionId(ctx, host);
           if (!sessionId) throw new Error("取不到当前会话");
           // 优先用 messageId 精确撤回；只有拿不到 id 时才退回按文本。
           const payload = { sessionId, scope };
@@ -514,7 +495,7 @@ window.__ModuleLoader__.load({
         if (!messageId && !text) continue;
 
         bar.appendChild(buildButton({ messageId, text }, ctx, async (result) => {
-          await reloadSession(result.sessionId, ctx);
+          reloadSession();
         }));
         added += 1;
       }
