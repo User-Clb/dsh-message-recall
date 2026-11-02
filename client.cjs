@@ -426,16 +426,27 @@ window.__ModuleLoader__.load({
 
     function sweep(ctx) {
       let added = 0;
-      for (const row of document.querySelectorAll("[data-chat-flow-kind='user']")) {
+
+      // 用户消息的官方 kind 是 input-message（不是 user）。
+      // steering / context 同样来自用户，一并覆盖；
+      // 再用 data-chat-node-key 兜底，避免 kind 改名后整体失效。
+      const selector = [
+        "[data-chat-flow-kind='input-message']",
+        "[data-chat-flow-kind='steering']",
+        "[data-chat-flow-kind='context']",
+      ].join(",");
+
+      for (const row of document.querySelectorAll(selector)) {
         if (!(row instanceof HTMLElement)) continue;
         if (row.querySelector(`[${MOUNT}]`)) continue;
 
+        // messageId 是主键：有它就能精确撤回，不依赖文本。
+        const messageId = messageIdOf(row);
         const bar = findActionRow(row);
         if (!bar) continue;
 
         const text = bubbleTextOf(row, bar);
-        const messageId = messageIdOf(row);
-        if (!text && !messageId) continue;
+        if (!messageId && !text) continue;
 
         bar.appendChild(buildButton({ messageId, text }, ctx, async (result) => {
           // 宿主已经真删除了；这里让会话窗口按新表面重建。
