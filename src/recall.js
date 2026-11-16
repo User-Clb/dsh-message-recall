@@ -194,68 +194,6 @@ function deriveStillContains(session, text) {
   });
 }
 
-/**
- * 列出仍在排队、尚未发出的消息（插话/steering 队列）。
- *
- * @param ctx - Host 根上下文。
- * @param sessionId - 会话 id。
- * @returns 队列条目数组。
- */
-function pendingMessages(ctx, sessionId) {
-  const agents = service(ctx, 'agents');
-  const agent = agents?.get?.(sessionId);
-  const out = [];
-  try {
-    for (const [slot, list] of [['nextTurn', agent?.inbox?.nextTurn], ['nextStep', agent?.inbox?.nextStep]]) {
-      for (const message of list ?? []) {
-        if (!message?.id) continue;
-        const content = message.content;
-        const text = typeof content === 'string'
-          ? content
-          : (Array.isArray(content) ? content.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('') : '');
-        out.push({ id: String(message.id), slot, text: text.slice(0, 200) });
-      }
-    }
-  } catch { /* ignore */ }
-  return out;
-}
-
-/**
- * 撤回一条排队中的消息（还没发给模型，直接从队列移除即可）。
- *
- * @param ctx - Host 根上下文。
- * @param sessionId - 会话 id。
- * @param messageId - 队列条目 id。
- * @returns 撤回结果。
- */
-async function recallPending(ctx, sessionId, messageId, text) {
-  const queue = pendingMessages(ctx, sessionId);
-  const norm = (v) => String(v ?? '').replace(/s+/g, ' ').trim();
-  const wanted = norm(text);
-
-  const target = queue.find((row) => row.id === messageId)
-    ?? (wanted
-      ? queue.find((row) => norm(row.text) === wanted)
-        ?? queue.find((row) => norm(row.text).includes(wanted) || wanted.includes(norm(row.text)))
-      : undefined);
-
-  if (!target) {
-    return { ok: false, code: 'not-pending', message: '这条消息已经不在队列里了' };
-  }
-  const controller = service(ctx, 'sessionController');
-  try {
-    await controller?.updateQueue?.({ sessionId, itemId: target.id, action: { kind: 'remove' } });
-  } catch (error) {
-    return { ok: false, code: 'queue-remove-failed', message: String(error?.message ?? error) };
-  }
-  // 复核：真的不在队列里了。
-  const left = pendingMessages(ctx, sessionId);
-  if (left.some((row) => row.id === target.id)) {
-    return { ok: false, code: 'queue-not-cleared', message: '队列移除未生效' };
-  }
-  return { ok: true, sessionId, pending: true, messageId: target.id, text: target.text, at: Date.now() };
-}
-
 /** 让下一次请求重新组装。 */
 function resetRequestSeries(ctx, sessionId) {
   const agents = service(ctx, 'agents');
@@ -369,47 +307,11 @@ function matchByText(events, text) {
  * @returns 撤回结果；成功时含回填输入框所需的原文。
  */
 async function recall(ctx, payload) {
-  // 排队中的消息还没进日志，直接从队列移除即可（不需要表面替换）。
-  if (payload?.pending === true) {
-    const sid = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
-    const mid = typeof payload?.messageId === 'string' ? payload.messageId : '';
-    const txt = typeof payload?.text === 'string' ? payload.text : '';
-    if (!sid || (!mid && !txt)) return { ok: false, code: 'no-session', message: '没有指定会话或消息' };
-    return recallPending(ctx, sid, mid, txt);
-  }
-
   const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
   // 必须明确指定会话：跨会话按文本猜会命中别的会话里同文本的消息
   // （表现为「该消息已被撤回」但当前气泡还在），所以这里不再兜底猜测。
   if (!sessionId) {
     return { ok: false, code: 'no-session', message: '没有指定会话，请重试' };
-  }
-
-  // 精确兜底：如果当前会话里没有这条消息，就在所有活会话里按 messageId 找。
-  // 这比让客户端猜会话可靠——消息 id 是全局唯一的。
-  let workingSessionId = sessionId;
-  if (typeof payload?.messageId === 'string' && payload.messageId) {
-    const hasHere = (() => {
-      try {
-        const ev = readEvents(ctx, workingSessionId);
-        return ev.some((e) => String(e?.data?.id ?? '') === payload.messageId);
-      } catch { return false; }
-    })();
-    if (!hasHere) {
-      const list = service(ctx, 'sessions')?.list?.() ?? [];
-      for (const row of list) {
-        const id = row?.id ?? row?.header?.id;
-        if (typeof id !== 'string' || !id || id === workingSessionId) continue;
-        const ev = readEvents(ctx, id);
-        if (ev.some((e) => String(e?.data?.id ?? '') === payload.messageId)) {
-          workingSessionId = id;
-          break;
-        }
-      }
-    }
-  }
-  if (workingSessionId !== sessionId) {
-    return recall(ctx, { ...payload, sessionId: workingSessionId });
   }
 
   let targetSeq;
@@ -434,28 +336,6 @@ async function recall(ctx, payload) {
   // 文本匹配是危险的（同文本消息会互相错配，导致区间从很靠前的位置开始，
   // 一次「及之后」就把前面和后面一起遮掉），因此只作为最后手段。
   const onSurface = new Set(nodes.map((seq) => Number(seq)));
-
-  // 首选：按「页面上第几条用户消息」定位。
-  // 客户端与宿主用同一规则（表面上的用户消息按 seq 升序），序号天然对齐，
-  // 不依赖 DOM 属性或文本匹配，避免错位导致误删整段。
-  if (targetSeq === undefined && Number.isFinite(Number(payload?.index))) {
-    // 一次建表：seq -> event，避免 O(n^2)。
-    const bySeq = new Map();
-    for (const row of events) bySeq.set(Number(row?.seq), row);
-
-    const userSeqs = [];
-    for (const seq of nodes) {
-      const event = bySeq.get(Number(seq));
-      if (!event || event.type !== 'user/message') continue;
-      if (isRecallMarker(event)) continue;
-      const kind = event?.data?.source?.kind;
-      if (kind !== undefined && kind !== 'user') continue;
-      if (userTextOf(event) === '') continue;
-      userSeqs.push(Number(seq));
-    }
-    const idx = Number(payload.index);
-    if (idx >= 0 && idx < userSeqs.length) targetSeq = userSeqs[idx];
-  }
 
   if (targetSeq === undefined && typeof payload?.messageId === 'string' && payload.messageId) {
     const wanted = payload.messageId;
@@ -485,8 +365,8 @@ async function recall(ctx, payload) {
 
   // 安全闸：文本/模糊定位拿到起点后，要求它确实是一条用户消息；
   // 否则宁可失败，也不冒险从一个错误的位置开始遮。
-  const anchor0 = events.find((event) => Number(event?.seq) === targetSeq);
-  if (!anchor0 || anchor0.type !== 'user/message') {
+  const anchor = events.find((event) => Number(event?.seq) === targetSeq);
+  if (!anchor || anchor.type !== 'user/message') {
     return {
       ok: false,
       code: 'bad-anchor',
@@ -494,32 +374,9 @@ async function recall(ctx, payload) {
     };
   }
 
-  // 序号定位的交叉校验：宿主取到的文本必须与客户端看到的文本一致。
-  // 不一致说明页面顺序与表面顺序错位，宁可拒绝也不误删。
-  if (Number.isFinite(Number(payload?.index)) && typeof payload?.text === 'string') {
-    const norm = (v) => String(v ?? '').replace(/s+/g, ' ').trim();
-    const hostText = norm(userTextOf(anchor0));
-    const clientText = norm(payload.text);
-    if (clientText && hostText && hostText !== clientText) {
-      return {
-        ok: false,
-        code: 'index-mismatch',
-        message: '定位到的消息与点击的不一致，已取消以免误删',
-      };
-    }
-  }
-
-  // 定位表面下标：目标必须精确存在于当前表面。
-  // 绝不能用 seq >= targetSeq 兜底——目标不在表面时会跳到很靠前的节点，
-  // 一次「及之后」就把整段历史连根拔掉。
-  let startIndex = nodes.findIndex((seq) => Number(seq) === Number(targetSeq));
-  if (startIndex < 0) {
-    return {
-      ok: false,
-      code: 'target-not-on-surface',
-      message: '这条消息已不在当前会话视图里（可能已撤回），已取消',
-    };
-  }
+  // 定位表面下标。
+  let startIndex = nodes.findIndex((seq) => seq >= targetSeq);
+  if (startIndex < 0) return { ok: false, code: 'already-recalled', message: '该消息已被撤回' };
 
   // 系统提示永不进入撤回区间。
   while (startIndex < nodes.length) {
@@ -536,47 +393,34 @@ async function recall(ctx, payload) {
     return { ok: false, code: 'already-recalled', message: '该消息已被撤回' };
   }
 
-  // 语义（严格按用户要求）：
-  //   only => 只撤「当前这一条消息」本身，不碰回复、不碰其它任何消息
-  //   from => 从这一条开始，一直撤到时间线末尾
-  // 两者都只向「时间线之后」作用，绝不触碰比当前更早的消息。
+  // 默认只撤本条：这是破坏面最小的操作。
+  // 「及之后」必须由调用方显式指定，避免一次误触清空整段对话。
   const scope = payload?.scope === 'from' ? 'from' : 'only';
 
-  // 严格语义：
-  //   only => 只撤「这一轮」：这条用户消息 + 它引出的助手回复/工具结果，
-  //           遇到下一条用户消息或轮次边界立刻停。
-  //   from => 从这条开始，一直到时间线末尾。
+  // 语义（按用户要求，两端一致）：
+  //   only => 只撤这一条消息本身，绝不连带任何其它消息
+  //   from => 从这一条开始，一直到时间线末尾
   // 两者都只向时间线之后作用，绝不触碰更早的消息。
-  // 严格语义（按用户要求）：
-  //   only => 只撤「这一条消息」本身，回复保持不动
-  //   from => 从这条开始，一直到时间线末尾（回复自然一并撤掉）
-  // 两者都只往时间线之后作用，绝不碰更早的消息。
-  // 按官方 session-surface 规范（.agents/notes/implemented/architecture/
-  // 2026-06-18-session-surface）构造 replace：
-  //   - startSeq / endSeq 必须都存在于当前 surface
-  //   - startSeq === endSeq 表示只替换单条
-  //   - sourceEventSeqs 必须列全所有被遮蔽的 surface seq
-  const surfaceSet = new Set(nodes.map((seq) => Number(seq)));
+  const lastIndex = scope === 'from' ? nodes.length - 1 : startIndex;
 
-  let endIndex = startIndex;
-  if (scope === 'from') {
-    endIndex = nodes.length - 1;
-  }
+  const shadowed = nodes.slice(startIndex, lastIndex + 1);
 
-  // 端点必须在表面上（按规范，否则事件非法）。
-  const startSeqCheck = Number(nodes[startIndex]);
-  const endSeqCheck = Number(nodes[endIndex]);
-  if (!surfaceSet.has(startSeqCheck) || !surfaceSet.has(endSeqCheck)) {
-    return { ok: false, code: 'endpoints-not-on-surface', message: '撤回端点不在当前视图上' };
-  }
-
-  const shadowed = nodes.slice(startIndex, endIndex + 1).map((seq) => Number(seq));
   const startSeq = shadowed[0];
   const endSeq = shadowed[shadowed.length - 1];
+  if (!Number.isSafeInteger(startSeq) || !Number.isSafeInteger(endSeq)) {
+    return { ok: false, code: 'bad-range', message: '撤回区间无效' };
+  }
 
-  // 规范要求：sourceEventSeqs 必须覆盖每一个被遮蔽的 surface 节点。
-  if (shadowed.length === 0 || shadowed[0] !== startSeq || shadowed[shadowed.length - 1] !== endSeq) {
-    return { ok: false, code: 'bad-range', message: '撤回区间不连续' };
+  // 安全闸：一次「及之后」不该遮蔽超过半个会话。
+  // 超过就说明起点定位错了（例如命中了很早的同文本消息），宁可拒绝。
+  const span = shadowed.length;
+  const surfaceSize = nodes.length;
+  if (surfaceSize >= 20 && span > Math.ceil(surfaceSize * 0.5)) {
+    return {
+      ok: false,
+      code: 'span-too-large',
+      message: `这次撤回会遮蔽 ${span}/${surfaceSize} 个节点，已取消以免误删。请确认是否点错了位置。`,
+    };
   }
 
   const text = isHumanUserEvent(candidate) ? userTextOf(candidate) : '';
@@ -652,20 +496,12 @@ async function recall(ctx, payload) {
   };
 }
 
+
+
 /** 只读状态：当前会话有哪些可撤回的用户消息。 */
 async function status(ctx, payload) {
-  // 不猜会话：必须由客户端明确指定，否则查到的可能是别的会话。
   const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
-  if (!sessionId) {
-    return {
-      ok: false,
-      code: 'no-session',
-      message: '没有指定会话',
-      sessions: (service(ctx, 'sessions')?.list?.() ?? [])
-        .map((row) => row?.id ?? row?.header?.id)
-        .filter((id) => typeof id === 'string' && id),
-    };
-  }
+  if (!sessionId) return { ok: false, code: 'no-session', message: '没有当前会话' };
 
   const session = liveSession(ctx, sessionId);
   const nodes = session ? surfaceNodes(session) : [];
@@ -693,7 +529,6 @@ async function status(ctx, payload) {
     surfaceNodes: nodes.length,
     totalEvents: events.length,
     recallable,
-    pending: pendingMessages(ctx, sessionId),
     live: Boolean(session),
   };
 }
