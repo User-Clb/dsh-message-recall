@@ -217,6 +217,50 @@ function inspectDerived(ctx, payload) {
   return { ok: true, sessions: out };
 }
 
+/**
+ * 只读：返回某会话「当前表面」的事件列表。
+ *
+ * 客户端拿它做无感重装：官方 MutableSessionEventSource.replace(entries)
+ * 会推送 { kind: 'replace' }，装配器随即重装窗口。
+ * 被 replace 遮蔽的节点不在这个列表里，所以撤回后界面自然消失。
+ *
+ * @param ctx - Host 根上下文。
+ * @param payload - `{ sessionId }`。
+ */
+function surfaceEvents(ctx, payload) {
+  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  if (!sessionId) return { ok: false, code: 'no-session', message: '没有指定会话' };
+
+  const sessions = ctx.get('sessions', false);
+  const session = sessions?.get?.(sessionId);
+  if (!session) return { ok: false, code: 'no-live-session', message: '会话未激活' };
+
+  let nodes = [];
+  try {
+    nodes = Array.isArray(session?.surface?.nodes) ? session.surface.nodes.map(Number) : [];
+  } catch { nodes = []; }
+
+  let events = [];
+  try {
+    events = [...(session.snapshotEvents?.() ?? [])];
+  } catch { events = []; }
+
+  const bySeq = new Map();
+  for (const event of events) bySeq.set(Number(event?.seq), event);
+
+  const picked = [];
+  for (const seq of nodes) {
+    const event = bySeq.get(Number(seq));
+    if (!event) continue;
+    // 撤回标记本身不进客户端窗口。
+    const id = event?.data?.id;
+    if (typeof id === 'string' && id.startsWith('rewind-')) continue;
+    picked.push(event);
+  }
+
+  return { ok: true, sessionId, count: picked.length, events: picked };
+}
+
 async function handleRequest(request, response, ctx) {
   try {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
@@ -231,6 +275,10 @@ async function handleRequest(request, response, ctx) {
     const body = await readBody(request);
     const payload = mergePayload(url, body);
 
+    if (action === 'surface') {
+      sendJson(response, 200, surfaceEvents(ctx, payload));
+      return;
+    }
     if (action === 'status') {
       sendJson(response, 200, await registerRecall.status(ctx, payload));
       return;
