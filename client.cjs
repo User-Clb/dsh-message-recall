@@ -227,7 +227,11 @@ window.__ModuleLoader__.load({
             const result = await onRecall({ sessionId, messageId, seq, pending, scope });
             if (!result?.ok) throw new Error(result?.message ?? t.failed);
             // 撤回成功：把「当前表面」推给装配器，界面无感重装。
-            try { await onReload?.(sessionId); } catch { /* 忽略 */ }
+            try {
+              const refreshed = await onReload?.(sessionId);
+              // 无感刷新失败时明确告知，而不是静默残留旧内容。
+              if (!refreshed) setNotice("已撤回，刷新界面后可见");
+            } catch { /* 忽略 */ }
           } catch (error) {
             setNotice(String(error?.message ?? error));
           } finally {
@@ -334,8 +338,21 @@ window.__ModuleLoader__.load({
         if (!data?.ok || !Array.isArray(data.events) || data.events.length === 0) return false;
         const entries = data.events.map((event) => ({ event }));
 
-        // 官方通道：binding 的 source.eventSource 是 MutableSessionEventSource，
-        // replace() 会发布 { kind:'replace' }，装配器重装窗口。
+        // 路径 1（当前内核权威）：sessions.binding(id).eventSource 是官方
+        // MutableSessionEventSource，uiConversation 装配器订阅了它。
+        // replace() 发布 { kind:'replace' } → 装配器按新表面重装窗口。
+        // 当前内核的 client Service 目录并未暴露 uiConversation，只暴露 sessions，
+        // 所以这一条才是真正生效的主路径。
+        try {
+          const sessions = ctx?.get?.("sessions", false);
+          const source = sessions?.binding?.(sessionId)?.eventSource;
+          if (source && typeof source.replace === "function") {
+            source.replace(entries, false);
+            return true;
+          }
+        } catch { /* 继续兜底 */ }
+
+        // 路径 2（旧内核兼容）：uiConversation.bindings
         try {
           const conversation = ctx?.get?.("uiConversation", false);
           const store = conversation?.bindings;
